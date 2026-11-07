@@ -377,11 +377,19 @@ class AirflowClient:
     # ------------------------------------------------------------------ runs
 
     def list_dag_runs(
-        self, dag_id: str, *, limit: int = 10, states: Iterable[str] | None = None
+        self,
+        dag_id: str,
+        *,
+        limit: int = 10,
+        states: Iterable[str] | None = None,
+        start_date_gte: str | None = None,
     ) -> list[dict[str, Any]]:
+        """Most recent runs first. ``start_date_gte`` is an ISO-8601 lower bound."""
         params: dict[str, Any] = {"order_by": "-run_after" if self.is_v2 else "-execution_date"}
         if states:
             params["state"] = list(states)
+        if start_date_gte:
+            params["start_date_gte"] = start_date_gte
         raw = self._paginate(f"/dags/{_seg(dag_id)}/dagRuns", "dag_runs", params, max_items=limit)
         return [self._normalize_run(run) for run in raw]
 

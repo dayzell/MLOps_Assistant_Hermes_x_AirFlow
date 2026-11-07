@@ -17,6 +17,10 @@ API_VERSIONS = ("v1", "v2")
 AUTH_MODES = ("basic", "token", "jwt")
 
 
+class DagNotAllowedError(Exception):
+    """The DAG is outside the configured allowlist."""
+
+
 class ConfigSource(Protocol):
     """Anything exposing Hermes' ``get_config(key, default)`` (the plugin context)."""
 

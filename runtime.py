@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import threading
+from datetime import UTC, datetime
 from typing import Any
 
 from agent.secret_scope import get_secret
@@ -46,6 +47,10 @@ class PluginRuntime:
     @property
     def ctx(self) -> ConfigSource:
         return self._ctx
+
+    @staticmethod
+    def now() -> datetime:
+        return datetime.now(UTC)
 
     def settings(self) -> Settings:
         return Settings.from_source(self._ctx)

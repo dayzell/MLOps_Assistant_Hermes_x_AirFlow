@@ -19,9 +19,42 @@ from plugins.plugin_storage import plugin_db
 
 from .config import PLUGIN_NAME
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 _MIGRATIONS: dict[int, list[str]] = {
+    2: [
+        # Per-task duration baselines used by reports to compute trends.
+        """
+        CREATE TABLE IF NOT EXISTS baselines (
+            dag_id     TEXT NOT NULL,
+            task_id    TEXT NOT NULL,
+            p50        REAL NOT NULL,
+            p95        REAL NOT NULL,
+            samples    INTEGER NOT NULL,
+            updated_at REAL NOT NULL,
+            PRIMARY KEY (dag_id, task_id)
+        )
+        """,
+        # Journal of every write action (who, what, when, why). Written by remediation tools.
+        """
+        CREATE TABLE IF NOT EXISTS audit_log (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts              REAL NOT NULL,
+            session_id      TEXT,
+            conversation_id TEXT,
+            tool            TEXT NOT NULL,
+            dag_id          TEXT NOT NULL,
+            run_id          TEXT,
+            task_ids        TEXT NOT NULL,
+            dry_run         INTEGER NOT NULL,
+            auto            INTEGER NOT NULL,
+            reason          TEXT,
+            outcome         TEXT NOT NULL,
+            details         TEXT
+        )
+        """,
+        "CREATE INDEX IF NOT EXISTS audit_log_ts ON audit_log (ts)",
+    ],
     1: [
         """
         CREATE TABLE IF NOT EXISTS diagnosis_cache (
@@ -162,3 +195,149 @@ def get_diagnosis(
         justification=row[7],
         diagnosed_at=float(row[8]),
     )
+
+
+# ---------------------------------------------------------------------------- baselines
+
+
+@dataclass(frozen=True)
+class Baseline:
+    dag_id: str
+    task_id: str
+    p50: float
+    p95: float
+    samples: int
+    updated_at: float
+
+
+def get_baselines(dag_id: str) -> dict[str, Baseline]:
+    """All task baselines of one DAG, keyed by task_id."""
+    with connect() as conn:
+        rows = conn.execute(
+            "SELECT dag_id, task_id, p50, p95, samples, updated_at FROM baselines WHERE dag_id = ?",
+            (dag_id,),
+        ).fetchall()
+    return {
+        row[1]: Baseline(row[0], row[1], float(row[2]), float(row[3]), int(row[4]), float(row[5]))
+        for row in rows
+    }
+
+
+def update_baseline(
+    dag_id: str,
+    task_id: str,
+    p50: float,
+    p95: float,
+    samples: int,
+    *,
+    alpha: float = 0.3,
+    now: float | None = None,
+) -> Baseline:
+    """Blend new observations into the stored baseline (exponential moving average)."""
+    timestamp = time.time() if now is None else now
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT p50, p95, samples FROM baselines WHERE dag_id = ? AND task_id = ?",
+            (dag_id, task_id),
+        ).fetchone()
+        if row is None:
+            new_p50, new_p95, total = p50, p95, samples
+        else:
+            new_p50 = (1 - alpha) * float(row[0]) + alpha * p50
+            new_p95 = (1 - alpha) * float(row[1]) + alpha * p95
+            total = int(row[2]) + samples
+        conn.execute(
+            """
+            INSERT INTO baselines (dag_id, task_id, p50, p95, samples, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT (dag_id, task_id) DO UPDATE SET
+                p50 = excluded.p50, p95 = excluded.p95,
+                samples = excluded.samples, updated_at = excluded.updated_at
+            """,
+            (dag_id, task_id, new_p50, new_p95, total, timestamp),
+        )
+    return Baseline(dag_id, task_id, new_p50, new_p95, total, timestamp)
+
+
+# ---------------------------------------------------------------------------- audit log
+
+
+def add_audit_entry(
+    *,
+    tool: str,
+    dag_id: str,
+    run_id: str | None,
+    task_ids: list[str],
+    dry_run: bool,
+    auto: bool,
+    reason: str | None,
+    outcome: str,
+    details: dict[str, Any] | None = None,
+    session_id: str | None = None,
+    conversation_id: str | None = None,
+    now: float | None = None,
+) -> int:
+    """Append one write action to the journal and return its id."""
+    with connect() as conn:
+        cursor = conn.execute(
+            """
+            INSERT INTO audit_log (ts, session_id, conversation_id, tool, dag_id, run_id,
+                                   task_ids, dry_run, auto, reason, outcome, details)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                time.time() if now is None else now,
+                session_id,
+                conversation_id,
+                tool,
+                dag_id,
+                run_id,
+                json.dumps(task_ids),
+                int(dry_run),
+                int(auto),
+                (reason or "")[:1000],
+                outcome,
+                json.dumps(details or {}, default=str)[:4000],
+            ),
+        )
+        return int(cursor.lastrowid or 0)
+
+
+def list_audit_entries(
+    since: float, dag_ids: list[str] | None = None, limit: int = 200
+) -> list[dict[str, Any]]:
+    """Journal entries since ``since`` (epoch seconds), newest first."""
+    query = (
+        "SELECT id, ts, session_id, conversation_id, tool, dag_id, run_id, task_ids, dry_run, "
+        "auto, reason, outcome, details FROM audit_log WHERE ts >= ?"
+    )
+    params: list[Any] = [since]
+    if dag_ids is not None:
+        if not dag_ids:
+            return []
+        query += f" AND dag_id IN ({','.join('?' for _ in dag_ids)})"
+        params.extend(dag_ids)
+    query += " ORDER BY ts DESC, id DESC LIMIT ?"
+    params.append(limit)
+    with connect() as conn:
+        rows = conn.execute(query, params).fetchall()
+    entries = []
+    for row in rows:
+        entries.append(
+            {
+                "id": row[0],
+                "ts": row[1],
+                "session_id": row[2],
+                "conversation_id": row[3],
+                "tool": row[4],
+                "dag_id": row[5],
+                "run_id": row[6],
+                "task_ids": json.loads(row[7] or "[]"),
+                "dry_run": bool(row[8]),
+                "auto": bool(row[9]),
+                "reason": row[10],
+                "outcome": row[11],
+                "details": json.loads(row[12] or "{}"),
+            }
+        )
+    return entries

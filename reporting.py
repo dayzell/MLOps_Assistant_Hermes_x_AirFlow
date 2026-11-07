@@ -1,0 +1,852 @@
+"""Standard monitoring report: always the same six sections, returned as JSON and Markdown.
+
+Sections (fixed order and keys):
+    1. scope_period     scope and period
+    2. health           success rate, runs, incidents
+    3. performance      per-task p50/p95 vs stored baseline, retries, queue time, SLA misses
+    4. data_quality     read from the data-quality XCom convention (never invented)
+    5. incidents        failed runs of the period and actions taken (audit log)
+    6. recommendations  rule-based, evidence attached
+"""
+
+from __future__ import annotations
+
+import ast
+import json
+import logging
+import math
+import re
+from collections import defaultdict
+from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
+from typing import Any
+
+from . import storage
+from .airflow_client import AirflowClient, AirflowError, parse_datetime
+from .config import DagNotAllowedError, Settings
+from .redaction import redact_value
+
+logger = logging.getLogger(__name__)
+
+SECTION_KEYS = (
+    "scope_period",
+    "health",
+    "performance",
+    "data_quality",
+    "incidents",
+    "recommendations",
+)
+SECTION_TITLES = {
+    "scope_period": "1. Périmètre et période",
+    "health": "2. Santé globale",
+    "performance": "3. Performance par tâche",
+    "data_quality": "4. Qualité des données",
+    "incidents": "5. Incidents et actions",
+    "recommendations": "6. Recommandations",
+}
+
+DQ_FIELDS: dict[str, tuple[type, ...]] = {
+    "rows": (int,),
+    "null_ratio": (int, float),
+    "freshness": (str, int, float),
+    "checks_passed": (bool,),
+}
+
+_PERIOD_RE = re.compile(r"^\s*(\d+)\s*([mhdw])\s*$", re.IGNORECASE)
+_PERIOD_UNITS = {"m": 60, "h": 3600, "d": 86400, "w": 7 * 86400}
+MAX_PERIOD = timedelta(days=90)
+
+MAX_DAGS = 50
+MAX_RUNS_PER_DAG = 200
+MAX_RUNS_DETAILED = 30  # runs whose task instances are fetched, per DAG
+MAX_TASKS_DQ = 30  # task instances scanned for the data-quality XCom
+MAX_TASK_ROWS = 50  # rows of the performance table
+MIN_BASELINE_SAMPLES = 3
+TREND_THRESHOLD = 0.10  # +/-10 % vs baseline p50 is "stable"
+BASELINE_ALPHA = 0.3
+_FATAL_ERRORS = frozenset({"auth", "network", "timeout", "config", "forbidden"})
+
+
+# ============================================================================ parsing helpers
+
+
+def parse_period(text: str) -> timedelta:
+    """Parse ``30m``, ``24h``, ``7d``, ``2w`` (max 90 days)."""
+    match = _PERIOD_RE.match(text or "")
+    if not match:
+        raise ValueError(f"Invalid period {text!r}: use a number followed by m, h, d or w (24h).")
+    delta = timedelta(seconds=int(match.group(1)) * _PERIOD_UNITS[match.group(2).lower()])
+    if delta <= timedelta(0) or delta > MAX_PERIOD:
+        raise ValueError("The period must be greater than 0 and at most 90 days.")
+    return delta
+
+
+@dataclass(frozen=True)
+class Scope:
+    kind: str  # all | dag | tag
+    value: str | None
+
+    @property
+    def label(self) -> str:
+        if self.kind == "all":
+            return "all"
+        if self.kind == "tag":
+            return f"tag:{self.value}"
+        return str(self.value)
+
+
+def parse_scope(text: str | None) -> Scope:
+    raw = (text or "all").strip()
+    if not raw or raw.lower() in {"all", "*"}:
+        return Scope("all", None)
+    if raw.lower().startswith("tag:"):
+        tag = raw[4:].strip()
+        if not tag:
+            raise ValueError("Empty tag in scope; use tag:<name>.")
+        return Scope("tag", tag)
+    return Scope("dag", raw)
+
+
+def percentile(values: list[float], q: float) -> float | None:
+    """Linear-interpolated percentile (numpy's default method); ``None`` for no data."""
+    if not values:
+        return None
+    ordered = sorted(values)
+    if len(ordered) == 1:
+        return round(ordered[0], 3)
+    rank = (len(ordered) - 1) * q / 100
+    low, high = math.floor(rank), math.ceil(rank)
+    result = ordered[low] + (ordered[high] - ordered[low]) * (rank - low)
+    return round(result, 3)
+
+
+def validate_data_quality(value: Any) -> tuple[dict[str, Any] | None, list[str]]:
+    """Check an XCom value against the data-quality convention.
+
+    Returns ``(normalised, problems)``; ``normalised`` is ``None`` when unusable.
+    """
+    if isinstance(value, str):
+        text = value.strip()
+        for loader in (json.loads, ast.literal_eval):
+            try:
+                value = loader(text)
+                break
+            except (ValueError, SyntaxError, TypeError, MemoryError, RecursionError):
+                continue
+    if not isinstance(value, dict):
+        return None, ["value is not an object"]
+    problems = []
+    normalised: dict[str, Any] = {}
+    for key, types in DQ_FIELDS.items():
+        if key not in value:
+            problems.append(f"missing '{key}'")
+            continue
+        item = value[key]
+        if key != "checks_passed" and isinstance(item, bool):
+            problems.append(f"'{key}' has the wrong type")
+            continue
+        if not isinstance(item, types):
+            problems.append(f"'{key}' has the wrong type")
+            continue
+        if key == "null_ratio" and isinstance(item, int | float) and not 0 <= item <= 1:
+            problems.append("'null_ratio' must be between 0 and 1")
+            continue
+        normalised[key] = item
+    return (normalised if not problems else None), problems
+
+
+def _iso(moment: datetime) -> str:
+    return moment.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _round(value: float | None, digits: int = 3) -> float | None:
+    return None if value is None else round(value, digits)
+
+
+# ============================================================================ builder
+
+
+@dataclass
+class _DagData:
+    dag: dict[str, Any]
+    runs: list[dict[str, Any]]
+    tis_by_run: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
+    sampled: bool = False
+    error: dict[str, Any] | None = None
+
+    @property
+    def dag_id(self) -> str:
+        return str(self.dag["dag_id"])
+
+
+class ReportBuilder:
+    """Collect Airflow data for a scope/period and render the standard report."""
+
+    def __init__(self, client: AirflowClient, settings: Settings, *, now: datetime) -> None:
+        self.client = client
+        self.settings = settings
+        self.now = now.astimezone(UTC)
+
+    def build(
+        self, scope_text: str | None, period_text: str | None, *, update_baseline: bool = True
+    ) -> dict[str, Any]:
+        scope = parse_scope(scope_text)
+        period_label = (period_text or self.settings.report_default_period).strip()
+        delta = parse_period(period_label)
+        start = self.now - delta
+
+        dags, dags_truncated = self._resolve_dags(scope)
+        data = [self._collect(dag, start) for dag in dags]
+
+        performance, perf_stats = self._performance(data)
+        report: dict[str, Any] = {
+            "scope_period": {
+                "scope": scope.label,
+                "period": period_label,
+                "start": _iso(start),
+                "end": _iso(self.now),
+                "generated_at": _iso(self.now),
+                "dag_count": len(dags),
+                "dags": [d.dag_id for d in data],
+                "dags_truncated": dags_truncated,
+                "sampled_dags": [d.dag_id for d in data if d.sampled],
+                "errors": [{"dag_id": d.dag_id, **(d.error or {})} for d in data if d.error],
+            },
+            "health": self._health(data),
+            "performance": performance,
+            "data_quality": self._data_quality(data),
+            "incidents": self._incidents(data, start),
+        }
+        report["recommendations"] = self._recommendations(report)
+        if update_baseline:
+            self._update_baselines(perf_stats)
+        return {"report": report, "markdown": render_markdown(report)}
+
+    # ------------------------------------------------------------------ collection
+
+    def _resolve_dags(self, scope: Scope) -> tuple[list[dict[str, Any]], bool]:
+        if scope.kind == "dag":
+            dag_id = str(scope.value)
+            if not self.settings.dag_allowed(dag_id):
+                raise DagNotAllowedError(
+                    f"DAG '{dag_id}' is outside the plugin allowlist (dag_allowlist); "
+                    "access refused."
+                )
+            return [self.client.get_dag_details(dag_id)], False
+        tags = [str(scope.value)] if scope.kind == "tag" else None
+        dags = [
+            dag
+            for dag in self.client.list_dags(tags=tags, only_active=True)
+            if dag.get("dag_id") and self.settings.dag_allowed(str(dag["dag_id"]))
+        ]
+        dags.sort(key=lambda d: str(d["dag_id"]))
+        return dags[:MAX_DAGS], len(dags) > MAX_DAGS
+
+    def _collect(self, dag: dict[str, Any], start: datetime) -> _DagData:
+        dag_id = str(dag["dag_id"])
+        try:
+            runs = self.client.list_dag_runs(
+                dag_id, limit=MAX_RUNS_PER_DAG, start_date_gte=_iso(start)
+            )
+            runs = [run for run in runs if self._in_window(run, start)]
+            detailed = runs[:MAX_RUNS_DETAILED]
+            tis_by_run = {
+                str(run["run_id"]): self.client.list_task_instances(dag_id, str(run["run_id"]))
+                for run in detailed
+            }
+            return _DagData(dag, runs, tis_by_run, sampled=len(runs) > len(detailed))
+        except AirflowError as exc:
+            if exc.error_type in _FATAL_ERRORS:
+                raise
+            return _DagData(dag, [], error=exc.to_dict())
+
+    def _in_window(self, run: dict[str, Any], start: datetime) -> bool:
+        moment = parse_datetime(run.get("start_date")) or parse_datetime(run.get("logical_date"))
+        return moment is not None and start <= moment <= self.now
+
+    # ------------------------------------------------------------------ section 2
+
+    def _health(self, data: list[_DagData]) -> dict[str, Any]:
+        totals: dict[str, int] = defaultdict(int)
+        per_dag = []
+        for item in data:
+            counts: dict[str, int] = defaultdict(int)
+            for run in item.runs:
+                counts[str(run.get("state") or "unknown")] += 1
+            for state, count in counts.items():
+                totals[state] += count
+            durations = [r["duration_s"] for r in item.runs if r.get("duration_s") is not None]
+            finished = counts["success"] + counts["failed"]
+            per_dag.append(
+                {
+                    "dag_id": item.dag_id,
+                    "is_paused": item.dag.get("is_paused"),
+                    "runs": len(item.runs),
+                    "success": counts["success"],
+                    "failed": counts["failed"],
+                    "other": len(item.runs) - finished,
+                    "success_rate": _round(counts["success"] / finished, 4) if finished else None,
+                    "last_run_state": item.runs[0].get("state") if item.runs else None,
+                    "last_run_start": item.runs[0].get("start_date") if item.runs else None,
+                    "run_duration_p50_s": percentile(durations, 50),
+                    "run_duration_p95_s": percentile(durations, 95),
+                }
+            )
+        total_runs = sum(len(item.runs) for item in data)
+        finished = totals["success"] + totals["failed"]
+        rate = totals["success"] / finished if finished else None
+        if total_runs == 0:
+            status = "no_data"
+        elif totals["failed"] == 0:
+            status = "healthy"
+        elif rate is not None and rate >= 0.9:
+            status = "degraded"
+        else:
+            status = "failing"
+        return {
+            "status": status,
+            "total_runs": total_runs,
+            "success": totals["success"],
+            "failed": totals["failed"],
+            "other": total_runs - finished,
+            "success_rate": _round(rate, 4),
+            "incidents": totals["failed"],
+            "per_dag": per_dag,
+        }
+
+    # ------------------------------------------------------------------ section 3
+
+    def _performance(
+        self, data: list[_DagData]
+    ) -> tuple[dict[str, Any], list[tuple[str, str, float, float, int]]]:
+        rows: list[dict[str, Any]] = []
+        stats: list[tuple[str, str, float, float, int]] = []
+        sla_misses: list[dict[str, Any]] = []
+        thresholds = self.settings.sla_thresholds
+
+        for item in data:
+            baselines = self._baselines(item.dag_id)
+            durations: dict[str, list[float]] = defaultdict(list)
+            queues: dict[str, list[float]] = defaultdict(list)
+            retries: dict[str, int] = defaultdict(int)
+            instances: dict[str, int] = defaultdict(int)
+            for run_id, tis in item.tis_by_run.items():
+                for ti in tis:
+                    task_id = str(ti.get("task_id"))
+                    instances[task_id] += 1
+                    duration = ti.get("duration_s")
+                    if duration is not None and ti.get("state") in ("success", "failed"):
+                        durations[task_id].append(float(duration))
+                        limit = thresholds.get(f"{item.dag_id}.{task_id}")
+                        if limit is not None and duration > limit:
+                            sla_misses.append(
+                                {
+                                    "level": "task",
+                                    "dag_id": item.dag_id,
+                                    "task_id": task_id,
+                                    "run_id": run_id,
+                                    "duration_s": duration,
+                                    "threshold_s": limit,
+                                }
+                            )
+                    queued = ti.get("queued_s")
+                    if queued is not None and queued >= 0:
+                        queues[task_id].append(float(queued))
+                    retries[task_id] += max(0, int(ti.get("try_number") or 1) - 1)
+
+            dag_limit = thresholds.get(item.dag_id)
+            if dag_limit is not None:
+                for run in item.runs:
+                    duration = run.get("duration_s")
+                    if duration is not None and duration > dag_limit:
+                        sla_misses.append(
+                            {
+                                "level": "dag",
+                                "dag_id": item.dag_id,
+                                "run_id": run.get("run_id"),
+                                "duration_s": duration,
+                                "threshold_s": dag_limit,
+                            }
+                        )
+
+            for task_id in sorted(instances):
+                values = durations.get(task_id, [])
+                p50, p95 = percentile(values, 50), percentile(values, 95)
+                baseline = baselines.get(task_id)
+                trend, change = "no_baseline", None
+                if baseline is not None and p50 is not None and baseline.p50 > 0:
+                    change = (p50 - baseline.p50) / baseline.p50
+                    if change > TREND_THRESHOLD:
+                        trend = "slower"
+                    elif change < -TREND_THRESHOLD:
+                        trend = "faster"
+                    else:
+                        trend = "stable"
+                rows.append(
+                    {
+                        "dag_id": item.dag_id,
+                        "task_id": task_id,
+                        "instances": instances[task_id],
+                        "duration_p50_s": p50,
+                        "duration_p95_s": p95,
+                        "baseline_p50_s": _round(baseline.p50) if baseline else None,
+                        "baseline_p95_s": _round(baseline.p95) if baseline else None,
+                        "trend": trend,
+                        "change_vs_baseline": _round(change, 4),
+                        "retries": retries[task_id],
+                        "queue_p50_s": percentile(queues.get(task_id, []), 50),
+                        "queue_p95_s": percentile(queues.get(task_id, []), 95),
+                    }
+                )
+                if p50 is not None and p95 is not None and len(values) >= MIN_BASELINE_SAMPLES:
+                    stats.append((item.dag_id, task_id, p50, p95, len(values)))
+
+        rows.sort(key=lambda r: (-(r["duration_p95_s"] or 0), r["dag_id"], r["task_id"]))
+        return (
+            {
+                "tasks": rows[:MAX_TASK_ROWS],
+                "tasks_truncated": len(rows) > MAX_TASK_ROWS,
+                "sla": {
+                    "configured": bool(thresholds),
+                    "miss_count": len(sla_misses),
+                    "misses": sla_misses[:100],
+                },
+            },
+            stats,
+        )
+
+    @staticmethod
+    def _baselines(dag_id: str) -> dict[str, storage.Baseline]:
+        try:
+            return storage.get_baselines(dag_id)
+        except Exception:
+            logger.warning("airflow-mlops: cannot read baselines", exc_info=True)
+            return {}
+
+    def _update_baselines(self, stats: list[tuple[str, str, float, float, int]]) -> None:
+        try:
+            for dag_id, task_id, p50, p95, samples in stats:
+                storage.update_baseline(
+                    dag_id,
+                    task_id,
+                    p50,
+                    p95,
+                    samples,
+                    alpha=BASELINE_ALPHA,
+                    now=self.now.timestamp(),
+                )
+        except Exception:
+            logger.warning("airflow-mlops: cannot update baselines", exc_info=True)
+
+    # ------------------------------------------------------------------ section 4
+
+    def _data_quality(self, data: list[_DagData]) -> dict[str, Any]:
+        key = self.settings.data_quality_xcom_key
+        per_dag = []
+        for item in data:
+            per_dag.append(self._dag_quality(item, key))
+        instrumented = [d for d in per_dag if d["status"] == "instrumented"]
+        failed_checks = sum(
+            1 for d in instrumented for c in d["checks"] if c.get("checks_passed") is False
+        )
+        return {
+            "convention_key": key,
+            "status": "instrumented" if instrumented else "not_instrumented",
+            "instrumented_dags": len(instrumented),
+            "failed_checks": failed_checks,
+            "per_dag": per_dag,
+        }
+
+    def _dag_quality(self, item: _DagData, key: str) -> dict[str, Any]:
+        base: dict[str, Any] = {"dag_id": item.dag_id}
+        run = next((r for r in item.runs if r.get("state") == "success"), None) or (
+            item.runs[0] if item.runs else None
+        )
+        if run is None:
+            return {
+                **base,
+                "status": "not_instrumented",
+                "reason": "no run in the period",
+                "checks": [],
+            }
+        run_id = str(run["run_id"])
+        tis = [ti for ti in item.tis_by_run.get(run_id, []) if ti.get("state") == "success"]
+        checks: list[dict[str, Any]] = []
+        invalid: list[dict[str, Any]] = []
+        for ti in tis[:MAX_TASKS_DQ]:
+            task_id = str(ti["task_id"])
+            map_index = ti.get("map_index")
+            map_arg = map_index if isinstance(map_index, int) and map_index >= 0 else None
+            try:
+                entries = self.client.list_xcom_entries(
+                    item.dag_id, run_id, task_id, key=key, map_index=map_arg, max_items=1
+                )
+                if not entries:
+                    continue
+                value = self.client.get_xcom_value(item.dag_id, run_id, task_id, key, map_arg)
+            except AirflowError as exc:
+                if exc.error_type in _FATAL_ERRORS:
+                    raise
+                continue
+            normalised, problems = validate_data_quality(redact_value(value))
+            if normalised is None:
+                invalid.append({"task_id": task_id, "problems": problems})
+            else:
+                checks.append({"task_id": task_id, **normalised})
+        base["run_id"] = run_id
+        if checks:
+            return {**base, "status": "instrumented", "checks": checks, "invalid": invalid}
+        if invalid:
+            return {**base, "status": "non_conformant", "checks": [], "invalid": invalid}
+        return {
+            **base,
+            "status": "not_instrumented",
+            "reason": f"no '{key}' XCom found",
+            "checks": [],
+        }
+
+    # ------------------------------------------------------------------ section 5
+
+    def _incidents(self, data: list[_DagData], start: datetime) -> dict[str, Any]:
+        failed_runs = []
+        for item in data:
+            for run in item.runs:
+                if run.get("state") != "failed":
+                    continue
+                run_id = str(run["run_id"])
+                tis = item.tis_by_run.get(run_id)
+                failed_tasks = (
+                    sorted(str(ti["task_id"]) for ti in tis if ti.get("state") == "failed")
+                    if tis is not None
+                    else None
+                )
+                entry: dict[str, Any] = {
+                    "dag_id": item.dag_id,
+                    "run_id": run_id,
+                    "start_date": run.get("start_date"),
+                    "end_date": run.get("end_date"),
+                    "failed_tasks": failed_tasks,
+                }
+                diagnoses = self._cached_diagnoses(item.dag_id, run_id, failed_tasks or [])
+                if diagnoses:
+                    entry["diagnosis"] = diagnoses
+                failed_runs.append(entry)
+        failed_runs.sort(key=lambda r: str(r.get("start_date") or ""), reverse=True)
+        try:
+            actions = storage.list_audit_entries(
+                start.timestamp(), dag_ids=[d.dag_id for d in data]
+            )
+            actions_error = None
+        except Exception:
+            logger.warning("airflow-mlops: cannot read the audit log", exc_info=True)
+            actions, actions_error = [], "audit log unavailable"
+        result: dict[str, Any] = {
+            "failed_run_count": len(failed_runs),
+            "failed_runs": failed_runs[:50],
+            "actions": [
+                {
+                    "ts": _iso(datetime.fromtimestamp(a["ts"], UTC)),
+                    "dag_id": a["dag_id"],
+                    "run_id": a["run_id"],
+                    "task_ids": a["task_ids"],
+                    "tool": a["tool"],
+                    "dry_run": a["dry_run"],
+                    "auto": a["auto"],
+                    "outcome": a["outcome"],
+                    "reason": a["reason"],
+                }
+                for a in actions
+            ],
+        }
+        if actions_error:
+            result["actions_error"] = actions_error
+        return result
+
+    @staticmethod
+    def _cached_diagnoses(dag_id: str, run_id: str, task_ids: list[str]) -> dict[str, str]:
+        found: dict[str, str] = {}
+        try:
+            for task_id in task_ids[:10]:
+                cached = storage.get_diagnosis(dag_id, run_id, task_id)
+                if cached is not None:
+                    found[task_id] = cached.category
+        except Exception:
+            logger.debug("airflow-mlops: diagnosis cache unavailable", exc_info=True)
+        return found
+
+    # ------------------------------------------------------------------ section 6
+
+    def _recommendations(self, report: dict[str, Any]) -> list[dict[str, Any]]:
+        recs: list[dict[str, Any]] = []
+        for dag in report["health"]["per_dag"]:
+            rate = dag["success_rate"]
+            if dag["failed"] and rate is not None and rate < 0.95:
+                recs.append(
+                    {
+                        "severity": "high" if rate < 0.8 else "medium",
+                        "dag_id": dag["dag_id"],
+                        "message": (
+                            f"{dag['failed']} run(s) en échec sur {dag['runs']} "
+                            f"(taux de succès {rate:.0%}) : lancer airflow_diagnose_run sur le "
+                            "dernier run en échec."
+                        ),
+                    }
+                )
+        for task in report["performance"]["tasks"]:
+            change = task["change_vs_baseline"]
+            if task["trend"] == "slower" and change is not None and change >= 0.25:
+                recs.append(
+                    {
+                        "severity": "medium",
+                        "dag_id": task["dag_id"],
+                        "task_id": task["task_id"],
+                        "message": (
+                            f"Tâche {task['task_id']} {change:+.0%} plus lente que sa ligne de "
+                            "base (p50) : vérifier le volume de données et les ressources."
+                        ),
+                    }
+                )
+            if task["instances"] and task["retries"] / task["instances"] >= 0.2:
+                recs.append(
+                    {
+                        "severity": "medium",
+                        "dag_id": task["dag_id"],
+                        "task_id": task["task_id"],
+                        "message": (
+                            f"Tâche {task['task_id']} instable : {task['retries']} retry(s) pour "
+                            f"{task['instances']} exécution(s) ; rechercher une cause transitoire."
+                        ),
+                    }
+                )
+            queue_p95 = task["queue_p95_s"]
+            if queue_p95 is not None and queue_p95 >= 300:
+                recs.append(
+                    {
+                        "severity": "low",
+                        "dag_id": task["dag_id"],
+                        "task_id": task["task_id"],
+                        "message": (
+                            f"Attente en file p95 de {queue_p95:.0f}s pour {task['task_id']} : "
+                            "vérifier la taille des pools et la capacité des workers."
+                        ),
+                    }
+                )
+        sla = report["performance"]["sla"]
+        if sla["miss_count"]:
+            recs.append(
+                {
+                    "severity": "medium",
+                    "message": f"{sla['miss_count']} dépassement(s) de SLA sur la période.",
+                }
+            )
+        elif not sla["configured"]:
+            recs.append(
+                {
+                    "severity": "info",
+                    "message": "Aucun seuil SLA configuré (sla_thresholds) : SLA non suivis.",
+                }
+            )
+        quality = report["data_quality"]
+        if quality["failed_checks"]:
+            recs.append(
+                {
+                    "severity": "high",
+                    "message": (
+                        f"{quality['failed_checks']} contrôle(s) qualité en échec : ne pas "
+                        "consommer les données concernées avant vérification."
+                    ),
+                }
+            )
+        missing = [d["dag_id"] for d in quality["per_dag"] if d["status"] != "instrumented"]
+        if missing:
+            recs.append(
+                {
+                    "severity": "info",
+                    "message": (
+                        "Qualité des données non instrumentée pour : "
+                        + ", ".join(missing[:10])
+                        + (" ..." if len(missing) > 10 else "")
+                        + f" (publier l'XCom '{quality['convention_key']}')."
+                    ),
+                }
+            )
+        if report["scope_period"]["errors"]:
+            recs.append(
+                {
+                    "severity": "medium",
+                    "message": "Certains DAGs n'ont pas pu être lus : voir scope_period.errors.",
+                }
+            )
+        if not any(r["severity"] in ("high", "medium", "low") for r in recs):
+            recs.insert(
+                0,
+                {
+                    "severity": "info",
+                    "message": "Aucune action requise : aucun incident ni dérive détectés.",
+                },
+            )
+        order = {"high": 0, "medium": 1, "low": 2, "info": 3}
+        recs.sort(key=lambda r: order[r["severity"]])
+        return recs
+
+
+# ============================================================================ markdown
+
+
+def _fmt_s(value: float | None) -> str:
+    if value is None:
+        return "—"
+    seconds = float(value)
+    if seconds < 60:
+        return f"{seconds:.1f}s"
+    minutes, secs = divmod(round(seconds), 60)
+    if minutes < 60:
+        return f"{minutes}m{secs:02d}s"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}h{minutes:02d}m"
+
+
+def _fmt_rate(value: float | None) -> str:
+    return "—" if value is None else f"{value:.1%}"
+
+
+def _cell(value: Any) -> str:
+    return str(value).replace("|", "\\|").replace("\n", " ")
+
+
+def render_markdown(report: dict[str, Any]) -> str:
+    """Render the report with a fixed template (same headings, same order, every time)."""
+    scope = report["scope_period"]
+    health = report["health"]
+    perf = report["performance"]
+    quality = report["data_quality"]
+    incidents = report["incidents"]
+    lines = [
+        f"# Rapport de monitoring Airflow — {scope['scope']} — {scope['period']}",
+        "",
+        f"## {SECTION_TITLES['scope_period']}",
+        "",
+        f"- Périmètre : `{scope['scope']}` ({scope['dag_count']} DAG(s))",
+        f"- Période : {scope['start']} → {scope['end']} ({scope['period']})",
+        f"- Généré le : {scope['generated_at']}",
+    ]
+    if scope["dags_truncated"]:
+        lines.append(f"- ⚠️ Périmètre tronqué aux {scope['dag_count']} premiers DAGs")
+    if scope["sampled_dags"]:
+        lines.append(
+            f"- Échantillonné (runs récents uniquement) : {', '.join(scope['sampled_dags'])}"
+        )
+    for error in scope["errors"]:
+        lines.append(f"- ⚠️ {error['dag_id']} illisible : {error.get('message')}")
+
+    lines += [
+        "",
+        f"## {SECTION_TITLES['health']}",
+        "",
+        f"- Statut : **{health['status']}**",
+        f"- Runs : {health['total_runs']} (succès {health['success']}, échecs {health['failed']}, "
+        f"autres {health['other']})",
+        f"- Taux de succès : {_fmt_rate(health['success_rate'])}",
+        f"- Incidents : {health['incidents']}",
+    ]
+    if health["per_dag"]:
+        lines += [
+            "",
+            "| DAG | Runs | Succès | Échecs | Taux | Durée p50 | Durée p95 | Dernier état |",
+            "|---|---|---|---|---|---|---|---|",
+        ]
+        for dag in health["per_dag"]:
+            lines.append(
+                f"| {_cell(dag['dag_id'])} | {dag['runs']} | {dag['success']} | {dag['failed']} "
+                f"| {_fmt_rate(dag['success_rate'])} | {_fmt_s(dag['run_duration_p50_s'])} "
+                f"| {_fmt_s(dag['run_duration_p95_s'])} | {dag['last_run_state'] or '—'} |"
+            )
+
+    lines += ["", f"## {SECTION_TITLES['performance']}", ""]
+    if perf["tasks"]:
+        lines += [
+            "| DAG | Tâche | p50 | p95 | Base p50 | Tendance | Retries | File p95 |",
+            "|---|---|---|---|---|---|---|---|",
+        ]
+        for task in perf["tasks"]:
+            change = task["change_vs_baseline"]
+            trend = task["trend"] + (f" ({change:+.0%})" if change is not None else "")
+            lines.append(
+                f"| {_cell(task['dag_id'])} | {_cell(task['task_id'])} "
+                f"| {_fmt_s(task['duration_p50_s'])} | {_fmt_s(task['duration_p95_s'])} "
+                f"| {_fmt_s(task['baseline_p50_s'])} | {trend} | {task['retries']} "
+                f"| {_fmt_s(task['queue_p95_s'])} |"
+            )
+        if perf["tasks_truncated"]:
+            lines.append(f"\n_Tableau limité aux {MAX_TASK_ROWS} tâches les plus longues (p95)._")
+    else:
+        lines.append("Aucune exécution de tâche sur la période.")
+    sla = perf["sla"]
+    if not sla["configured"]:
+        lines.append("\n- SLA : non configuré")
+    else:
+        lines.append(f"\n- SLA manqués : {sla['miss_count']}")
+        for miss in sla["misses"][:10]:
+            target = miss["dag_id"] + (f".{miss['task_id']}" if miss.get("task_id") else "")
+            lines.append(
+                f"  - {target} ({miss['run_id']}) : {_fmt_s(miss['duration_s'])} > "
+                f"{_fmt_s(miss['threshold_s'])}"
+            )
+
+    lines += [
+        "",
+        f"## {SECTION_TITLES['data_quality']}",
+        "",
+        f"Convention : XCom `{quality['convention_key']}` "
+        "(`rows`, `null_ratio`, `freshness`, `checks_passed`).",
+        "",
+    ]
+    for dag in quality["per_dag"]:
+        if dag["status"] == "instrumented":
+            for check in dag["checks"]:
+                verdict = "✅" if check["checks_passed"] else "❌"
+                lines.append(
+                    f"- {verdict} {dag['dag_id']}.{check['task_id']} : {check['rows']} lignes, "
+                    f"nulls {check['null_ratio']:.1%}, fraîcheur {check['freshness']}"
+                )
+        elif dag["status"] == "non_conformant":
+            problems = "; ".join(
+                f"{i['task_id']}: {', '.join(i['problems'])}" for i in dag["invalid"]
+            )
+            lines.append(f"- ⚠️ {dag['dag_id']} : XCom non conforme ({problems})")
+        else:
+            lines.append(f"- {dag['dag_id']} : non instrumenté")
+    if not quality["per_dag"]:
+        lines.append("- non instrumenté")
+
+    lines += [
+        "",
+        f"## {SECTION_TITLES['incidents']}",
+        "",
+        f"- Runs en échec : {incidents['failed_run_count']}",
+    ]
+    for run in incidents["failed_runs"][:20]:
+        tasks = ", ".join(run["failed_tasks"]) if run["failed_tasks"] else "?"
+        diagnosis = run.get("diagnosis")
+        diag = (
+            " — diagnostic : " + ", ".join(f"{k}={v}" for k, v in diagnosis.items())
+            if diagnosis
+            else ""
+        )
+        lines.append(f"  - {run['dag_id']} / {run['run_id']} : tâches {tasks}{diag}")
+    if incidents["actions"]:
+        lines.append(f"- Actions prises : {len(incidents['actions'])}")
+        for action in incidents["actions"][:20]:
+            mode = "dry-run" if action["dry_run"] else ("auto" if action["auto"] else "manuel")
+            lines.append(
+                f"  - {action['ts']} {action['tool']} {action['dag_id']} "
+                f"{', '.join(action['task_ids'])} ({mode}) → {action['outcome']}"
+            )
+    else:
+        lines.append("- Actions prises : aucune")
+
+    lines += ["", f"## {SECTION_TITLES['recommendations']}", ""]
+    labels = {"high": "🔴", "medium": "🟠", "low": "🟡", "info": "ℹ️"}
+    for rec in report["recommendations"]:
+        lines.append(f"- {labels[rec['severity']]} {rec['message']}")
+    return "\n".join(lines) + "\n"

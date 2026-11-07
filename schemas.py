@@ -192,6 +192,38 @@ AIRFLOW_DIAGNOSE_RUN: dict[str, Any] = {
     },
 }
 
+AIRFLOW_BUILD_REPORT: dict[str, Any] = {
+    "name": "airflow_build_report",
+    "description": (
+        "Build the standard Airflow monitoring report for a scope and period. Always returns "
+        "the same six sections, as JSON ('report') and Markdown ('markdown'): 1 scope and "
+        "period, 2 global health (success rate, runs, incidents), 3 per-task performance "
+        "(p50/p95 vs stored baseline, retries, queue time, SLA misses), 4 data quality (from "
+        "the data-quality XCom convention, never invented), 5 incidents and actions taken, "
+        "6 recommendations. Read-only, except that it refreshes the stored duration "
+        "baselines. Follow the airflow-report skill when presenting it."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "scope": {
+                "type": "string",
+                "description": "'all' (default), a DAG id, or 'tag:<tag>'.",
+            },
+            "period": {
+                "type": "string",
+                "description": "Look-back window: number + m/h/d/w, e.g. '24h', '7d'. "
+                "Defaults to the configured report period.",
+            },
+            "update_baseline": {
+                "type": "boolean",
+                "description": "Refresh the stored duration baselines (default true).",
+            },
+        },
+        "required": [],
+    },
+}
+
 READ_TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
     schema["name"]: schema
     for schema in (
@@ -203,5 +235,6 @@ READ_TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
         AIRFLOW_GET_XCOMS,
         AIRFLOW_GET_DEPENDENCIES,
         AIRFLOW_DIAGNOSE_RUN,
+        AIRFLOW_BUILD_REPORT,
     )
 }

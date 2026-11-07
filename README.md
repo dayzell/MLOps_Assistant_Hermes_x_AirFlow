@@ -3,10 +3,10 @@
 Plugin **Hermes Agent** autonome qui transforme l'agent en assistant MLOps pour **Apache Airflow** :
 surveillance des DAGs, diagnostic de pannes, relance ciblée et protégée, rapports de monitoring normés.
 
-> **État : Phase 2 (v0.2.0)**
-> - Fait : 7 outils en lecture seule, redaction, et diagnostic de panne avec classification
->   transient / critical.
-> - À venir : rapports + skills (phase 3), remédiation protégée (phase 4).
+> **État : Phase 3 (v0.3.0)**
+> - Fait : outils en lecture seule, redaction, diagnostic de panne avec classification
+>   transient / critical, rapports normés, commande `/airflow-report` et 3 skills.
+> - À venir : remédiation protégée (phase 4).
 
 ## Installation
 
@@ -89,6 +89,7 @@ n'exposent jamais de traceback.
 | `airflow_get_xcoms` | XComs d'une tâche, masqués et tronqués |
 | `airflow_get_dependencies` | Graphe amont/aval d'une tâche avec `trigger_rule` |
 | `airflow_diagnose_run` | Diagnostic complet d'un run en échec : racine vs impactées, logs, XComs, classification justifiée |
+| `airflow_build_report` | Rapport de monitoring normé (6 sections, JSON + Markdown) |
 
 Types d'erreur : `invalid_argument`, `dag_not_allowed`, `config`, `auth`, `forbidden`,
 `not_found`, `bad_request`, `timeout`, `network`, `server`, `http`, `internal`.
@@ -123,7 +124,7 @@ L'outil agrège en un seul appel les éléments nécessaires pour interpréter u
 - `guidance`.
 
 Les paramètres du DAG sont joints, masqués. L'interprétation en langage naturel reste le travail
-du LLM, guidé par la skill `airflow-triage` (phase 3).
+du LLM, guidé par la skill `airflow-triage`.
 
 ### Classification
 
@@ -153,9 +154,54 @@ Fonctionnement :
 Les classifications sont mises en cache dans la base SQLite du plugin (`plugin_db`). Le
 mécanisme d'approbation de la phase 4 s'appuie sur ce cache.
 
+## Rapports (`airflow_build_report`, `/airflow-report`)
+
+`airflow_build_report(scope, period)` produit un rapport **toujours dans la même structure**.
+Il renvoie un JSON (`report`, avec 6 clés fixes) et un Markdown (`markdown`, gabarit fixe).
+
+- `scope` : `all` (par défaut), un `dag_id` ou `tag:<tag>`. L'allowlist s'applique toujours.
+- `period` : un nombre suivi de `m`, `h`, `d` ou `w` (`24h`, `7d`…), au maximum 90 jours. Par
+  défaut, `report_default_period`.
+
+| # | Section | Contenu |
+|---|---|---|
+| 1 | Périmètre et période | DAGs couverts, fenêtre UTC, DAGs échantillonnés ou illisibles |
+| 2 | Santé globale | statut (`healthy` / `degraded` / `failing` / `no_data`), runs, taux de succès, incidents, tableau par DAG |
+| 3 | Performance par tâche | durées p50 / p95, ligne de base et tendance, retries, temps d'attente en file p50 / p95, SLA manqués |
+| 4 | Qualité des données | lue uniquement depuis la convention XCom ci-dessous ; sinon « non instrumenté » |
+| 5 | Incidents et actions | runs en échec, tâches en échec, diagnostic en cache, actions du journal d'audit |
+| 6 | Recommandations | règles simples (échecs, lenteur > +25 %, retries, file d'attente, SLA, qualité), triées par gravité |
+
+**Comment les chiffres sont calculés**
+
+- **Ligne de base** : stockée dans `plugin_db()` par couple `(dag_id, task_id)`. Elle est mise à
+  jour à chaque rapport par moyenne mobile exponentielle, avec un poids de 30 % pour les
+  nouvelles mesures et à partir de 3 exécutions. `update_baseline=false` laisse la base
+  intacte. La tendance compare le p50 à la base : `stable` (±10 %), `slower`, `faster` ou
+  `no_baseline`.
+- **SLA** : calculés seulement si `sla_thresholds` est configuré :
+  - `"dag_id": secondes` s'applique à la durée du run ;
+  - `"dag_id.task_id": secondes` s'applique à la durée de la tâche.
+- **Bornes** : au plus 50 DAGs, 200 runs par DAG, et le détail des tâches des 30 runs les plus
+  récents. Les DAGs concernés sont signalés comme échantillonnés.
+
+**Commande slash** : `/airflow-report [all|<dag_id>|tag:<tag>] [24h|7d]` renvoie directement le
+Markdown. Un argument qui commence par un chiffre est lu comme la période.
+
+## Skills embarquées (`skills/`)
+
+Elles sont enregistrées via `ctx.register_skill` et accessibles sous le nom
+`airflow-mlops:<nom>`.
+
+| Skill | Rôle |
+|---|---|
+| `airflow-triage` | Procédure de diagnostic : trouver la racine, lire logs / XComs / dépendances, classifier, proposer. Relancer le minimum, jamais le DAG entier, toujours un *dry run* d'abord. |
+| `airflow-report` | Présentation du rapport normé : résumé exécutif, puis les 6 sections inchangées. Aucun chiffre inventé. |
+| `airflow-fix-proposal` | Proposition de correctif pour une erreur critique : cause probable, diff, risques, vérification. L'agent propose, il n'applique jamais de patch. |
+
 ## Convention XCom « qualité des données »
 
-Airflow n'a pas de notion native de qualité des données. Le rapport (phase 3) lit la convention
+Airflow n'a pas de notion native de qualité des données. Le rapport lit la convention
 suivante : la tâche de contrôle qualité pousse un XCom de clé `data_quality_xcom_key`
 (`data_quality` par défaut) contenant :
 

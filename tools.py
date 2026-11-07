@@ -14,9 +14,10 @@ from collections.abc import Callable
 from typing import Any
 
 from .airflow_client import AirflowError
-from .config import Settings
+from .config import DagNotAllowedError, Settings
 from .diagnosis import RunDiagnoser, load_rules
 from .redaction import redact_text, redact_value
+from .reporting import ReportBuilder, parse_period, parse_scope
 from .runtime import PluginRuntime
 from .textutils import excerpt_log, truncate_text, truncate_value
 from .views import build_dependency_view, collect_xcoms
@@ -30,10 +31,6 @@ _MAX_XCOM_ENTRIES = 50
 
 class ToolInputError(ValueError):
     """Invalid tool arguments (reported to the LLM as ``invalid_argument``)."""
-
-
-class DagNotAllowedError(Exception):
-    """The DAG is outside the configured allowlist."""
 
 
 # ---------------------------------------------------------------------------- helpers
@@ -141,6 +138,7 @@ class ReadTools:
             "airflow_get_xcoms": safe_handler(self.get_xcoms),
             "airflow_get_dependencies": safe_handler(self.get_dependencies),
             "airflow_diagnose_run": safe_handler(self.diagnose_run),
+            "airflow_build_report": safe_handler(self.build_report),
         }
 
     # -- airflow_list_dags
@@ -310,3 +308,47 @@ class ReadTools:
             self.runtime.client(settings), settings, load_rules(settings.error_patterns_path)
         )
         return ok(**diagnoser.diagnose(dag_id, run_id))
+
+    # -- airflow_build_report
+    def build_report(self, args: dict[str, Any]) -> str:
+        scope = args.get("scope", "all")
+        period = args.get("period")
+        if not isinstance(scope, str) or (period is not None and not isinstance(period, str)):
+            raise ToolInputError("'scope' and 'period' must be strings.")
+        update_baseline = _optional_bool(args, "update_baseline")
+        result = self._report(scope, period, True if update_baseline is None else update_baseline)
+        return ok(**result)
+
+    def _report(self, scope: str, period: str | None, update_baseline: bool) -> dict[str, Any]:
+        settings = self.runtime.settings()
+        try:  # validate before any network call
+            parsed_scope = parse_scope(scope)
+            parse_period(period or settings.report_default_period)
+        except ValueError as exc:
+            raise ToolInputError(str(exc)) from exc
+        if parsed_scope.kind == "dag":
+            _check_allowed(settings, str(parsed_scope.value))
+        builder = ReportBuilder(self.runtime.client(settings), settings, now=self.runtime.now())
+        return builder.build(scope, period, update_baseline=update_baseline)
+
+    # -- /airflow-report slash command
+    def report_command(self, raw_args: str = "", **kwargs: Any) -> str:
+        """``/airflow-report [scope] [period]`` -> Markdown report (plain text on error)."""
+        scope, period = parse_command_args(raw_args)
+        result = json.loads(safe_handler(self.build_report)({"scope": scope, "period": period}))
+        if result.get("ok"):
+            return str(result["markdown"])
+        err = result["error"]
+        return f"❌ /airflow-report : {err['message']} ({err['type']})"
+
+
+def parse_command_args(raw_args: str | None) -> tuple[str, str | None]:
+    """Split ``/airflow-report`` arguments: a token starting with a digit (``24h``, ``7d``)
+    is the period (validated later), anything else is the scope."""
+    scope, period = "all", None
+    for token in (raw_args or "").split():
+        if token[0].isdigit():
+            period = token
+        else:
+            scope = token
+    return scope, period
