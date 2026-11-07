@@ -318,6 +318,7 @@ class AirflowClient:
                 "doc_md": raw.get("doc_md"),
                 "params": raw.get("params") or {},
                 "fileloc": raw.get("fileloc"),
+                "relative_fileloc": raw.get("relative_fileloc"),
             }
         )
         return dag

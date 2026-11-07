@@ -3,13 +3,13 @@
 Plugin **Hermes Agent** autonome qui transforme l'agent en assistant MLOps pour **Apache Airflow** :
 surveillance des DAGs, diagnostic de pannes, relance ciblée et protégée, rapports de monitoring normés.
 
-> **État : Phase 4 (v0.4.0)**
+> **État : v0.5.0 — phases 1 à 5 livrées**
 > - Fait : outils en lecture seule, redaction, diagnostic de panne avec classification
 >   transient / critical, rapports normés, commande `/airflow-report`, 3 skills, et
 >   remédiation protégée (relance ciblée, approbation humaine, politique de relance
 >   automatique, journal d'audit).
-> - Phase 5 (optionnelle) : plan du bac à sable de test des correctifs
->   ([docs/phase5_sandbox_plan.md](docs/phase5_sandbox_plan.md)), non implémenté.
+> - Phase 5 : bac à sable Docker jetable pour tester un correctif avant de le proposer
+>   ([docs/phase5_sandbox_plan.md](docs/phase5_sandbox_plan.md)) — **v0.5.0**.
 
 📘 **Vue d'ensemble simple des fonctionnalités, des outils et des réglages :
 [docs/GUIDE_UTILISATEUR.md](docs/GUIDE_UTILISATEUR.md).** Ce README est la référence technique.
@@ -96,6 +96,7 @@ n'exposent jamais de traceback.
 | `airflow_get_dependencies` | Graphe amont/aval d'une tâche avec `trigger_rule` |
 | `airflow_diagnose_run` | Diagnostic complet d'un run en échec : racine vs impactées, logs, XComs, classification justifiée |
 | `airflow_build_report` | Rapport de monitoring normé (6 sections, JSON + Markdown) |
+| `airflow_sandbox_test` | Teste un correctif (diff) dans un conteneur Docker jetable, sans réseau ni secrets ; masqué si `sandbox_enabled: false` |
 | `airflow_clear_tasks` | **Écriture.** Relance ciblée de tâches d'un run (dry run par défaut, protégée) ; masquée si `read_only: true` |
 
 Types d'erreur : `invalid_argument`, `dag_not_allowed`, `config`, `auth`, `forbidden`,
@@ -271,6 +272,51 @@ runs, les refus, les relances et les erreurs Airflow. Chaque entrée contient :
 Une relance réelle est d'abord journalisée comme `pending`. **Si le journal est indisponible,
 la relance est refusée.** Le rapport (section 5) affiche ces actions.
 
+## Bac à sable (`airflow_sandbox_test`)
+
+`airflow_sandbox_test(dag_id, patch, level="import", task_id?, run_id?)` teste un correctif
+avant qu'il soit proposé.
+
+**Déroulé**
+
+1. Le diff unifié est appliqué à une **copie** de `sandbox_dags_path`, dans
+   `plugin_data_dir("airflow-mlops")/sandbox/<id>/`. Cette copie est supprimée après le test.
+2. Le script [sandbox_runner/check_dag.py](sandbox_runner/check_dag.py) est lancé dans un
+   conteneur jetable, via `ctx.dispatch_tool("terminal", ...)`. L'appel passe donc par le
+   pipeline d'approbation de Hermes.
+
+**Le conteneur**
+
+- `--network none`, aucun secret ;
+- `--cpus` / `--memory` sans swap / `--pids-limit 256` ;
+- système de fichiers `--read-only`, avec un `/tmp` limité ;
+- `--cap-drop ALL`, `no-new-privileges`, utilisateur non root ;
+- `timeout --signal KILL`.
+
+**Les niveaux**
+
+- `import` : `DagBag`, aucune erreur d'import ;
+- `structure` : tâches et dépendances comparées à la production ;
+- `task` : `airflow tasks test` d'**une** tâche, en mode échantillon.
+
+**Les refus et protections**
+
+- Le niveau `task` est refusé pour les `sandbox_heavy_operators`.
+- Un niveau au-delà de `sandbox_max_level` déclenche la validation humaine (hook
+  `pre_tool_call`).
+- Les tests sont limités : un à la fois, et `sandbox_max_tests_per_session` au total.
+- Le diff est refusé s'il sort du dossier, supprime un fichier, ou si ses lignes de contexte
+  sont introuvables.
+- Chaque test est journalisé (`audit_log`).
+
+**Le résultat** est un JSON structuré : `passed`, `stages`, `exit_code`, `oom`, `timed_out`,
+`log_excerpt`, `patched_files`, `limits`.
+
+**Prérequis** : Docker accessible au terminal **local** de Hermes, et une image
+`sandbox_image` contenant Airflow et les dépendances des DAGs. Le conteneur n'a pas de réseau,
+donc pas de `pip install` possible. Mise en place et convention d'échantillon :
+[guide utilisateur § 6](docs/GUIDE_UTILISATEUR.md).
+
 ## Convention XCom « qualité des données »
 
 Airflow n'a pas de notion native de qualité des données. Le rapport lit la convention
@@ -311,6 +357,9 @@ chiffres. Exemple dans [demo-local-airflow/dags/mlops_demo.py](demo-local-airflo
     (`read_only: true`), passe par la validation humaine de Hermes et est journalisé.
   - La relance automatique sans validation est une option explicite
     (`auto_remediation_enabled`), bornée aux erreurs transitoires.
+  - Le bac à sable (`sandbox_enabled`, désactivé par défaut) lance `docker run` via l'outil
+    `terminal` de Hermes. Le conteneur est jetable, sans réseau ni secrets. Il lit une copie
+    temporaire des DAGs, placée dans `plugin_data_dir`.
 
 ## Développement
 

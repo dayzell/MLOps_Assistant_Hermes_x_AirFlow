@@ -7,6 +7,7 @@ lives here, in one place, and is mirrored in ``plugin.yaml``.
 from __future__ import annotations
 
 import fnmatch
+import re
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
@@ -15,6 +16,8 @@ TOOLSET = "airflow"
 
 API_VERSIONS = ("v1", "v2")
 AUTH_MODES = ("basic", "token", "jwt")
+SANDBOX_LEVELS = ("import", "structure", "task")
+SANDBOX_MAX_TIMEOUT = 540  # Hermes' terminal foreground limit is 600 s
 
 
 class DagNotAllowedError(Exception):
@@ -48,6 +51,26 @@ DEFAULTS: dict[str, Any] = {
     "auto_retry_max_attempts": 2,
     "auto_retry_backoff_seconds": 300,
     "error_patterns_path": "",
+    "sandbox_enabled": False,
+    "sandbox_image": "",
+    "sandbox_dags_path": "",
+    "sandbox_max_level": "structure",
+    "sandbox_cpus": 1.0,
+    "sandbox_memory": "2g",
+    "sandbox_timeout_seconds": 300,
+    "sandbox_sample_rows": 1000,
+    "sandbox_heavy_operators": [
+        "SparkSubmitOperator",
+        "KubernetesPodOperator",
+        "DatabricksSubmitRunOperator",
+        "SnowflakeOperator",
+        "BigQueryInsertJobOperator",
+        "EmrAddStepsOperator",
+        "BashOperator",
+        "DockerOperator",
+        "SSHOperator",
+    ],
+    "sandbox_max_tests_per_session": 5,
 }
 
 
@@ -88,6 +111,18 @@ def _as_str_list(value: Any, default: list[str]) -> list[str]:
     return list(default)
 
 
+def _as_memory(value: Any, default: str) -> str:
+    """Docker memory size such as ``512m`` or ``2g`` (capped at 16g)."""
+    text = str(value or "").strip().lower()
+    match = re.fullmatch(r"(\d+)([mg])", text)
+    if not match:
+        return default
+    megabytes = int(match.group(1)) * (1024 if match.group(2) == "g" else 1)
+    if megabytes < 256 or megabytes > 16 * 1024:
+        return default
+    return text
+
+
 def _as_choice(value: Any, choices: tuple[str, ...], default: str) -> str:
     text = str(value).strip().lower() if value is not None else ""
     return text if text in choices else default
@@ -117,6 +152,16 @@ class Settings:
     auto_retry_max_attempts: int = DEFAULTS["auto_retry_max_attempts"]
     auto_retry_backoff_seconds: int = DEFAULTS["auto_retry_backoff_seconds"]
     error_patterns_path: str = DEFAULTS["error_patterns_path"]
+    sandbox_enabled: bool = DEFAULTS["sandbox_enabled"]
+    sandbox_image: str = DEFAULTS["sandbox_image"]
+    sandbox_dags_path: str = DEFAULTS["sandbox_dags_path"]
+    sandbox_max_level: str = DEFAULTS["sandbox_max_level"]
+    sandbox_cpus: float = DEFAULTS["sandbox_cpus"]
+    sandbox_memory: str = DEFAULTS["sandbox_memory"]
+    sandbox_timeout_seconds: int = DEFAULTS["sandbox_timeout_seconds"]
+    sandbox_sample_rows: int = DEFAULTS["sandbox_sample_rows"]
+    sandbox_heavy_operators: tuple[str, ...] = tuple(DEFAULTS["sandbox_heavy_operators"])
+    sandbox_max_tests_per_session: int = DEFAULTS["sandbox_max_tests_per_session"]
 
     @classmethod
     def from_source(cls, source: ConfigSource) -> Settings:
@@ -170,6 +215,29 @@ class Settings:
                 raw("auto_retry_backoff_seconds"), DEFAULTS["auto_retry_backoff_seconds"], 0
             ),
             error_patterns_path=str(raw("error_patterns_path") or ""),
+            sandbox_enabled=_as_bool(raw("sandbox_enabled"), DEFAULTS["sandbox_enabled"]),
+            sandbox_image=str(raw("sandbox_image") or "").strip(),
+            sandbox_dags_path=str(raw("sandbox_dags_path") or "").strip(),
+            sandbox_max_level=_as_choice(
+                raw("sandbox_max_level"), SANDBOX_LEVELS, DEFAULTS["sandbox_max_level"]
+            ),
+            sandbox_cpus=min(_as_float(raw("sandbox_cpus"), DEFAULTS["sandbox_cpus"], 0.1), 8.0),
+            sandbox_memory=_as_memory(raw("sandbox_memory"), DEFAULTS["sandbox_memory"]),
+            sandbox_timeout_seconds=min(
+                _as_int(raw("sandbox_timeout_seconds"), DEFAULTS["sandbox_timeout_seconds"], 30),
+                SANDBOX_MAX_TIMEOUT,
+            ),
+            sandbox_sample_rows=_as_int(
+                raw("sandbox_sample_rows"), DEFAULTS["sandbox_sample_rows"], 1
+            ),
+            sandbox_heavy_operators=tuple(
+                _as_str_list(raw("sandbox_heavy_operators"), DEFAULTS["sandbox_heavy_operators"])
+            ),
+            sandbox_max_tests_per_session=_as_int(
+                raw("sandbox_max_tests_per_session"),
+                DEFAULTS["sandbox_max_tests_per_session"],
+                0,
+            ),
         )
 
     @property

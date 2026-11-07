@@ -43,6 +43,8 @@ class PluginRuntime:
         self._client_slot: Any = SingletonSlot()
         self._client_key: tuple[Any, ...] | None = None
         self._lock = threading.Lock()
+        # One sandbox container at a time (tests are heavy compared with API reads).
+        self.sandbox_lock = threading.Lock()
 
     @property
     def ctx(self) -> ConfigSource:
@@ -66,6 +68,13 @@ class PluginRuntime:
             lambda: AirflowClient(settings, load_credentials())
         )
         return client
+
+    def dispatch(self, tool_name: str, args: dict[str, Any]) -> str:
+        """Run another Hermes tool through Hermes' normal approval and redaction pipeline."""
+        dispatch_tool = getattr(self._ctx, "dispatch_tool", None)
+        if dispatch_tool is None:
+            raise RuntimeError("this Hermes context cannot dispatch tools")
+        return str(dispatch_tool(tool_name, args))
 
     def reset_client(self) -> None:
         current = self._client_slot.peek()

@@ -1,5 +1,5 @@
 name: airflow-mlops
-version: 0.4.0
+version: 0.5.0
 description: Apache Airflow MLOps assistant — monitor DAGs, diagnose failed runs, targeted retries and standard reports
 author: Joseph Keita
 manifest_version: 2
@@ -23,6 +23,7 @@ provides_tools:
   - airflow_diagnose_run
   - airflow_build_report
   - airflow_clear_tasks
+  - airflow_sandbox_test
 
 provides_hooks:
   - pre_tool_call
@@ -125,3 +126,53 @@ config_schema:
     type: str
     default: ""
     description: Optional path to a custom error_patterns.yaml (defaults to the bundled rules).
+  sandbox_enabled:
+    type: bool
+    default: false
+    description: Enable airflow_sandbox_test (Docker must be available to Hermes' local terminal).
+  sandbox_image:
+    type: str
+    default: ""
+    description: Docker image with Airflow + your DAG dependencies (built once, e.g. FROM apache/airflow).
+  sandbox_dags_path:
+    type: str
+    default: ""
+    description: Local folder of your DAGs; copied for each test, never modified.
+  sandbox_max_level:
+    type: str
+    default: structure
+    choices: [import, structure, task]
+    description: Highest level run without asking you; higher levels need your approval.
+  sandbox_cpus:
+    type: float
+    default: 1.0
+    description: CPU limit of the sandbox container (max 8).
+  sandbox_memory:
+    type: str
+    default: 2g
+    description: Memory limit of the sandbox container (256m to 16g, no swap).
+  sandbox_timeout_seconds:
+    type: int
+    default: 300
+    description: Maximum duration of one sandbox test (30 to 540 seconds).
+  sandbox_sample_rows:
+    type: int
+    default: 1000
+    description: Sample size exposed to the task as AIRFLOW_SANDBOX_SAMPLE_ROWS.
+  sandbox_heavy_operators:
+    type: list
+    default:
+      - SparkSubmitOperator
+      - KubernetesPodOperator
+      - DatabricksSubmitRunOperator
+      - SnowflakeOperator
+      - BigQueryInsertJobOperator
+      - EmrAddStepsOperator
+      - BashOperator
+      - DockerOperator
+      - SSHOperator
+    description: Operators never executed at the 'task' level (import/structure checks only).
+  sandbox_max_tests_per_session:
+    type: int
+    default: 5
+    description: Maximum number of sandbox tests per Hermes session.

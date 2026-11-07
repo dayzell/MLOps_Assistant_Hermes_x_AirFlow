@@ -292,3 +292,47 @@ AIRFLOW_CLEAR_TASKS: dict[str, Any] = {
 }
 
 WRITE_TOOL_SCHEMAS: dict[str, dict[str, Any]] = {AIRFLOW_CLEAR_TASKS["name"]: AIRFLOW_CLEAR_TASKS}
+
+
+AIRFLOW_SANDBOX_TEST: dict[str, Any] = {
+    "name": "airflow_sandbox_test",
+    "description": (
+        "Test a proposed DAG fix in a throw-away Docker sandbox BEFORE presenting it. Applies "
+        "the unified diff to a COPY of the DAGs folder (the user's files are never modified) "
+        "and runs a bounded check in a container with no network, no secrets and CPU/memory/"
+        "time limits. Levels, lightest first: 'import' (the patched DAG loads), 'structure' "
+        "(tasks and dependencies vs production), 'task' (runs ONE task on a data sample; only "
+        "when the user asks, and never for heavy operators like Spark or Kubernetes). Start "
+        "with 'import'. Never changes Airflow. Budgeted per session."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "dag_id": _DAG_ID,
+            "patch": {
+                "type": "string",
+                "description": "Unified diff of the fix, with paths relative to the DAGs "
+                "folder (e.g. '--- a/train.py' / '+++ b/train.py').",
+            },
+            "level": {
+                "type": "string",
+                "enum": ["import", "structure", "task"],
+                "description": "How far to test (default 'import').",
+            },
+            "task_id": {
+                "type": "string",
+                "description": "Task to run (required for level 'task'; checked for 'structure').",
+            },
+            "run_id": {
+                "type": "string",
+                "description": "Failed run whose upstream XComs are given to the task as "
+                "fixtures (level 'task' only, optional).",
+            },
+        },
+        "required": ["dag_id", "patch"],
+    },
+}
+
+SANDBOX_TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
+    AIRFLOW_SANDBOX_TEST["name"]: AIRFLOW_SANDBOX_TEST
+}

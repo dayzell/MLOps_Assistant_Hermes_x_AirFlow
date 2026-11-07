@@ -1,0 +1,412 @@
+"""Sandbox: diff application, workspace isolation, bounded docker command, result parsing,
+guardrails (disabled, heavy operators, budget, lock), approval hook and audit journal.
+
+Docker is never started: ``dispatch_tool("terminal")`` is faked and inspects the workspace
+that the real command would mount.
+"""
+
+from __future__ import annotations
+
+import importlib.util
+import json
+import shlex
+from pathlib import Path
+from typing import Any
+
+import payloads as p
+import pytest
+import respx
+from airflow_mlops import storage
+from airflow_mlops.config import Settings
+from airflow_mlops.guardrails import make_pre_tool_call_hook
+from airflow_mlops.sandbox import (
+    SandboxError,
+    apply_unified_diff,
+    build_docker_command,
+    copy_dags_folder,
+    parse_terminal_result,
+)
+from harness import ROOT, FakeContext, make_context
+
+BUGGY = 'import os\n\n\ndef train(frame):\n    return frame["target"]\n\n\nVALUE = 1\n'
+PATCH = """--- a/train.py
++++ b/train.py
+@@ -40,2 +40,2 @@
+ def train(frame):
+-    return frame["target"]
++    return frame.get("target")
+"""
+
+
+def sentinel(passed: bool = True, **stages: Any) -> str:
+    body = {"passed": passed, "stages": stages or {"import": {"passed": passed}}}
+    return "booting...\nSANDBOX_RESULT " + json.dumps(body)
+
+
+def terminal(output: str, exit_code: int = 0, err: str | None = None) -> str:
+    return json.dumps({"output": output, "exit_code": exit_code, "error": err})
+
+
+def mounted_workspace(command: str) -> Path:
+    argv = shlex.split(command.removeprefix("MSYS_NO_PATHCONV=1 "))
+    volume = argv[argv.index("-v") + 1]
+    return Path(volume.rsplit(":/sandbox:ro", 1)[0])
+
+
+@pytest.fixture
+def dags(tmp_path: Path) -> Path:
+    folder = tmp_path / "my-dags"
+    (folder / "lib").mkdir(parents=True)
+    (folder / "train.py").write_text(BUGGY, encoding="utf-8")
+    (folder / "lib" / "helpers.py").write_text("X = 1\n", encoding="utf-8")
+    (folder / ".git").mkdir()
+    (folder / ".git" / "config").write_text("secret", encoding="utf-8")
+    return folder
+
+
+def sandbox_ctx(dags: Path, **config: Any) -> FakeContext:
+    settings = {
+        "api_version": "v2",
+        "auth_mode": "jwt",
+        "sandbox_enabled": True,
+        "sandbox_image": "my/airflow:3.1-deps",
+        "sandbox_dags_path": str(dags),
+        **config,
+    }
+    return make_context(**settings)
+
+
+@pytest.fixture
+def api() -> Any:
+    with respx.mock(base_url="http://airflow.test/api/v2", assert_all_called=False) as router:
+        router.post("http://airflow.test/auth/token").respond(201, json={"access_token": "j"})
+        router.get("/dags/train/tasks").respond(json=p.tasks("v2"))
+        yield router
+
+
+# --------------------------------------------------------------------------- unified diff
+
+
+def test_patch_applies_despite_wrong_line_numbers(tmp_path: Path) -> None:
+    (tmp_path / "train.py").write_text(BUGGY, encoding="utf-8")
+    assert apply_unified_diff(tmp_path, PATCH) == ["train.py"]
+    assert 'frame.get("target")' in (tmp_path / "train.py").read_text(encoding="utf-8")
+
+
+def test_patch_tolerates_extra_leading_folder(tmp_path: Path) -> None:
+    (tmp_path / "train.py").write_text(BUGGY, encoding="utf-8")
+    apply_unified_diff(
+        tmp_path,
+        PATCH.replace("a/train.py", "a/dags/train.py").replace("b/train.py", "b/dags/train.py"),
+    )
+    assert 'frame.get("target")' in (tmp_path / "train.py").read_text(encoding="utf-8")
+
+
+def test_patch_multiple_hunks_new_file_and_crlf(tmp_path: Path) -> None:
+    (tmp_path / "a.py").write_bytes(b"one\r\ntwo\r\nthree\r\nfour\r\n")
+    patch = (
+        "--- a/a.py\n+++ b/a.py\n@@ -1,1 +1,1 @@\n-one\n+ONE\n@@ -4,1 +4,1 @@\n-four\n+FOUR\n"
+        "--- /dev/null\n+++ b/new/util.py\n@@ -0,0 +1,2 @@\n+A = 1\n+B = 2\n"
+    )
+    assert apply_unified_diff(tmp_path, patch) == ["a.py", "new/util.py"]
+    assert (tmp_path / "a.py").read_bytes() == b"ONE\r\ntwo\r\nthree\r\nFOUR\r\n"
+    assert (tmp_path / "new" / "util.py").read_text(encoding="utf-8") == "A = 1\nB = 2\n"
+
+
+@pytest.mark.parametrize(
+    ("patch", "message"),
+    [
+        ("--- a/train.py\n+++ b/train.py\n@@ -1 +1 @@\n-not there\n+x\n", "does not apply"),
+        ("--- a/train.py\n+++ /dev/null\n@@ -1 +0,0 @@\n-import os\n", "deletes"),
+        ("--- a/../evil.py\n+++ b/../evil.py\n@@ -0,0 +1 @@\n+x\n", "outside"),
+        ("--- /dev/null\n+++ /etc/cron.d/x\n@@ -0,0 +1 @@\n+x\n", "outside"),
+        ("--- a/missing.py\n+++ b/missing.py\n@@ -1 +1 @@\n-a\n+b\n", "does not exist"),
+        ("just some text", "no file change"),
+    ],
+)
+def test_bad_patches_are_refused(tmp_path: Path, patch: str, message: str) -> None:
+    (tmp_path / "train.py").write_text(BUGGY, encoding="utf-8")
+    with pytest.raises(SandboxError, match=message):
+        apply_unified_diff(tmp_path, patch)
+
+
+def test_copy_skips_vcs_and_caches(dags: Path, tmp_path: Path) -> None:
+    (dags / "__pycache__").mkdir()
+    (dags / "__pycache__" / "x.pyc").write_bytes(b"\x00")
+    target = tmp_path / "copy"
+    assert copy_dags_folder(dags, target) == 2
+    assert (target / "lib" / "helpers.py").is_file()
+    assert not (target / ".git").exists()
+
+
+# --------------------------------------------------------------------------- docker command
+
+
+def test_docker_command_is_bounded_and_isolated(tmp_path: Path) -> None:
+    settings = Settings(
+        sandbox_image="img:1",
+        sandbox_cpus=1.0,
+        sandbox_memory="2g",
+        sandbox_timeout_seconds=300,
+        sandbox_sample_rows=500,
+    )
+    command = build_docker_command(
+        settings,
+        tmp_path,
+        level="task",
+        dag_id="train",
+        task_id="fit; rm -rf /",
+        container_name="sbx-1",
+    )
+    assert command.startswith("MSYS_NO_PATHCONV=1 docker run --rm ")
+    argv = shlex.split(command.removeprefix("MSYS_NO_PATHCONV=1 "))
+    joined = " ".join(argv)
+    for flag in (
+        "--network none",
+        "--cpus 1",
+        "--memory 2g",
+        "--memory-swap 2g",
+        "--pids-limit 256",
+        "--read-only",
+        "--cap-drop ALL",
+        "--security-opt no-new-privileges",
+        "--entrypoint timeout",
+    ):
+        assert flag in joined, flag
+    assert f"{tmp_path.resolve().as_posix()}:/sandbox:ro" in argv
+    assert "AIRFLOW_SANDBOX_SAMPLE_ROWS=500" in argv
+    assert argv[argv.index("--task-id") + 1] == "fit; rm -rf /"  # quoted, not executed
+    assert not any(a.startswith("AIRFLOW_CONN") or "PASSWORD" in a for a in argv)
+    assert argv[argv.index("img:1") + 1 : argv.index("img:1") + 4] == ["--signal", "KILL", "300"]
+
+
+# --------------------------------------------------------------------------- result parsing
+
+
+def test_parse_success() -> None:
+    result = parse_terminal_result(terminal(sentinel(True)), Settings())
+    assert result["passed"] is True and result["stages"]["import"]["passed"] is True
+
+
+@pytest.mark.parametrize(
+    ("exit_code", "key", "text"),
+    [
+        (137, "oom", "memory limit"),
+        (124, "timed_out", "Timed out"),
+        (125, None, "Docker"),
+        (127, None, "Docker"),
+    ],
+)
+def test_parse_failures(exit_code: int, key: str | None, text: str) -> None:
+    result = parse_terminal_result(terminal("Killed", exit_code), Settings())
+    assert result["passed"] is False and text in result["error"]
+    if key:
+        assert result[key] is True
+
+
+def test_parse_blocked_terminal_and_redaction() -> None:
+    raw = json.dumps(
+        {"output": "password=hunter2", "exit_code": -1, "error": "BLOCKED: denied by user"}
+    )
+    result = parse_terminal_result(raw, Settings())
+    assert "denied by user" in result["error"]
+    assert "hunter2" not in json.dumps(result)
+
+
+# --------------------------------------------------------------------------- tool end to end
+
+
+def test_tool_hidden_and_refused_when_disabled(dags: Path, api: Any) -> None:
+    ctx = sandbox_ctx(dags, sandbox_enabled=False)
+    assert ctx.tools["airflow_sandbox_test"]["check_fn"]() is False
+    result = ctx.call("airflow_sandbox_test", dag_id="train", patch=PATCH)
+    assert result["error"]["type"] == "sandbox" and "disabled" in result["error"]["message"]
+
+
+def test_import_level_end_to_end(dags: Path, api: Any) -> None:
+    ctx = sandbox_ctx(dags)
+    seen: dict[str, Any] = {}
+
+    def fake_terminal(tool: str, args: dict[str, Any]) -> str:
+        workspace = mounted_workspace(args["command"])
+        seen["tool"] = tool
+        seen["timeout"] = args["timeout"]
+        seen["patched"] = (workspace / "dags" / "train.py").read_text(encoding="utf-8")
+        seen["runner"] = (workspace / "check_dag.py").is_file()
+        seen["expected"] = json.loads((workspace / "expected_structure.json").read_text("utf-8"))
+        seen["workspace"] = workspace
+        return terminal(sentinel(True))
+
+    ctx.dispatch_handler = fake_terminal
+    result = ctx.call("airflow_sandbox_test", dag_id="train", patch=PATCH)
+    assert result["ok"] is True and result["passed"] is True, result
+    assert seen["tool"] == "terminal" and seen["timeout"] == 360
+    assert 'frame.get("target")' in seen["patched"]
+    assert seen["runner"] is True
+    assert seen["expected"]["transform"] == ["load", "quality_check"]
+    assert result["patched_files"] == ["train.py"]
+    assert result["limits"]["network"] == "none"
+    assert not seen["workspace"].exists()  # cleaned up
+    assert 'frame["target"]' in (dags / "train.py").read_text(encoding="utf-8")  # untouched
+    entry = storage.list_audit_entries(0)[0]
+    assert (entry["tool"], entry["outcome"], entry["dry_run"]) == (
+        "airflow_sandbox_test",
+        "passed",
+        True,
+    )
+
+
+def test_failed_import_is_reported(dags: Path, api: Any) -> None:
+    ctx = sandbox_ctx(dags)
+    ctx.dispatch_handler = lambda tool, args: terminal(
+        sentinel(
+            False, **{"import": {"passed": False, "import_errors": {"train.py": "SyntaxError"}}}
+        ),
+        1,
+    )
+    result = ctx.call("airflow_sandbox_test", dag_id="train", patch=PATCH)
+    assert result["ok"] is True and result["passed"] is False
+    assert result["stages"]["import"]["import_errors"] == {"train.py": "SyntaxError"}
+    assert storage.list_audit_entries(0)[0]["outcome"] == "failed"
+
+
+def test_task_level_with_fixtures(dags: Path, api: Any) -> None:
+    api.get("/dags/train/dagRuns/run_1/taskInstances/extract/xcomEntries").respond(
+        json={"xcom_entries": [{"key": "return_value", "map_index": -1}], "total_entries": 1}
+    )
+    api.get("/dags/train/dagRuns/run_1/taskInstances/extract/xcomEntries/return_value").respond(
+        json={"value": {"rows": 10, "api_token": "abc"}}
+    )
+    ctx = sandbox_ctx(dags)
+    fixtures: dict[str, Any] = {}
+
+    def fake_terminal(tool: str, args: dict[str, Any]) -> str:
+        workspace = mounted_workspace(args["command"])
+        fixtures.update(json.loads((workspace / "fixtures" / "xcoms.json").read_text("utf-8")))
+        assert "--task-id" in args["command"]
+        return terminal(sentinel(True))
+
+    ctx.dispatch_handler = fake_terminal
+    result = ctx.call(
+        "airflow_sandbox_test",
+        dag_id="train",
+        patch=PATCH,
+        level="task",
+        task_id="transform",
+        run_id="run_1",
+    )
+    assert result["passed"] is True
+    assert fixtures == {"extract": {"return_value": {"rows": 10, "api_token": "[REDACTED]"}}}
+
+
+def test_heavy_operator_is_never_run(dags: Path, api: Any) -> None:
+    ctx = sandbox_ctx(dags, sandbox_heavy_operators=["EmailOperator"])
+    result = ctx.call(
+        "airflow_sandbox_test", dag_id="train", patch=PATCH, level="task", task_id="notify"
+    )
+    assert result["error"]["type"] == "sandbox" and "EmailOperator" in result["error"]["message"]
+    assert not getattr(ctx, "dispatched", [])
+    # import / structure checks stay allowed for that DAG
+    assert ctx.call("airflow_sandbox_test", dag_id="train", patch=PATCH)["ok"] is True
+
+
+def test_task_level_requires_task_id(dags: Path, api: Any) -> None:
+    result = sandbox_ctx(dags).call(
+        "airflow_sandbox_test", dag_id="train", patch=PATCH, level="task"
+    )
+    assert result["error"]["type"] == "sandbox"
+
+
+def test_budget_per_session(dags: Path, api: Any) -> None:
+    ctx = sandbox_ctx(dags, sandbox_max_tests_per_session=1)
+    ctx.dispatch_handler = lambda tool, args: terminal(sentinel(True))
+    assert ctx.call("airflow_sandbox_test", dag_id="train", patch=PATCH)["ok"] is True
+    second = ctx.call("airflow_sandbox_test", dag_id="train", patch=PATCH)
+    assert second["error"]["type"] == "sandbox" and "budget" in second["error"]["message"]
+
+
+def test_one_test_at_a_time(dags: Path, api: Any) -> None:
+    ctx = sandbox_ctx(dags)
+    outcome: dict[str, Any] = {}
+
+    def nested(tool: str, args: dict[str, Any]) -> str:
+        outcome["inner"] = ctx.call("airflow_sandbox_test", dag_id="train", patch=PATCH)
+        return terminal(sentinel(True))
+
+    ctx.dispatch_handler = nested
+    assert ctx.call("airflow_sandbox_test", dag_id="train", patch=PATCH)["ok"] is True
+    assert "already running" in outcome["inner"]["error"]["message"]
+
+
+def test_bad_patch_is_journaled_as_refused(dags: Path, api: Any) -> None:
+    ctx = sandbox_ctx(dags)
+    result = ctx.call(
+        "airflow_sandbox_test",
+        dag_id="train",
+        patch="--- a/x.py\n+++ b/x.py\n@@ -1 +1 @@\n-a\n+b\n",
+    )
+    assert result["error"]["type"] == "sandbox"
+    assert storage.list_audit_entries(0)[0]["outcome"] == "refused"
+
+
+def test_allowlist_applies(dags: Path, api: Any) -> None:
+    ctx = sandbox_ctx(dags, dag_allowlist=["etl_*"])
+    result = ctx.call("airflow_sandbox_test", dag_id="train", patch=PATCH)
+    assert result["error"]["type"] == "dag_not_allowed"
+
+
+# --------------------------------------------------------------------------- approval hook
+
+
+def test_hook_for_sandbox_levels() -> None:
+    enabled = Settings(sandbox_enabled=True, sandbox_max_level="structure")
+    hook = make_pre_tool_call_hook(lambda: enabled)
+    assert hook(tool_name="airflow_sandbox_test", args={"dag_id": "train"}) is None
+    assert (
+        hook(tool_name="airflow_sandbox_test", args={"dag_id": "train", "level": "structure"})
+        is None
+    )
+    decision = hook(
+        tool_name="airflow_sandbox_test",
+        args={"dag_id": "train", "level": "task", "task_id": "fit"},
+    )
+    assert decision["action"] == "approve" and "no network" in decision["message"]
+    disabled = make_pre_tool_call_hook(lambda: Settings())
+    assert disabled(tool_name="airflow_sandbox_test", args={"dag_id": "t"})["action"] == "block"
+    outside = make_pre_tool_call_hook(
+        lambda: Settings(sandbox_enabled=True, dag_allowlist=("etl_*",))
+    )
+    assert outside(tool_name="airflow_sandbox_test", args={"dag_id": "t"})["action"] == "block"
+
+
+# --------------------------------------------------------------------------- settings / runner
+
+
+def test_sandbox_settings_are_bounded() -> None:
+    ctx = make_context(
+        sandbox_memory="999g",
+        sandbox_timeout_seconds=99999,
+        sandbox_cpus=64,
+        sandbox_max_level="everything",
+    )
+    settings = Settings.from_source(ctx)
+    assert settings.sandbox_memory == "2g"
+    assert settings.sandbox_timeout_seconds == 540
+    assert settings.sandbox_cpus == 8.0
+    assert settings.sandbox_max_level == "structure"
+
+
+def test_runner_compare_structure() -> None:
+    spec = importlib.util.spec_from_file_location(
+        "check_dag", ROOT / "sandbox_runner" / "check_dag.py"
+    )
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)  # stdlib-only at import time (Airflow is imported lazily)
+    diff = module.compare_structure({"a": ["b"], "b": []}, {"a": ["c"], "c": []})
+    assert diff == {
+        "added_tasks": ["c"],
+        "removed_tasks": ["b"],
+        "added_edges": ["a>>c"],
+        "removed_edges": ["a>>b"],
+    }

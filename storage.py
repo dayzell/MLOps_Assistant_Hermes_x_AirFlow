@@ -415,3 +415,19 @@ def update_audit_entry(entry_id: int, *, outcome: str, details: dict[str, Any] |
             "UPDATE audit_log SET outcome = ?, details = ? WHERE id = ?",
             (outcome, json.dumps(details or {}, default=str)[:4000], entry_id),
         )
+
+
+def count_audit_entries(tool: str, session_id: str | None, since: float = 0.0) -> int:
+    """Number of journal entries of ``tool`` for one Hermes session (budget checks)."""
+    with connect() as conn:
+        if session_id is None:
+            row = conn.execute(
+                "SELECT COUNT(*) FROM audit_log WHERE tool = ? AND session_id IS NULL AND ts >= ?",
+                (tool, since),
+            ).fetchone()
+        else:
+            row = conn.execute(
+                "SELECT COUNT(*) FROM audit_log WHERE tool = ? AND session_id = ? AND ts >= ?",
+                (tool, session_id, since),
+            ).fetchone()
+    return int(row[0])

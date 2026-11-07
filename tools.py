@@ -20,6 +20,7 @@ from .guardrails import ClearRequest, ClearTasksAction, GuardrailError
 from .redaction import redact_text, redact_value
 from .reporting import ReportBuilder, parse_period, parse_scope
 from .runtime import PluginRuntime
+from .sandbox import SandboxError, SandboxRequest, SandboxRunner
 from .textutils import excerpt_log, truncate_text, truncate_value
 from .views import build_dependency_view, collect_xcoms
 
@@ -66,6 +67,8 @@ def safe_handler(func: Callable[..., str], *, context_aware: bool = False) -> Ha
             return error("invalid_argument", str(exc))
         except GuardrailError as exc:
             return error("guardrail", str(exc))
+        except SandboxError as exc:
+            return error("sandbox", str(exc))
         except DagNotAllowedError as exc:
             return error("dag_not_allowed", str(exc), 403)
         except AirflowError as exc:
@@ -420,3 +423,58 @@ class WriteTools:
 def _context_str(context: dict[str, Any], key: str) -> str | None:
     value = context.get(key)
     return str(value) if value not in (None, "") else None
+
+
+class SandboxTools:
+    """``airflow_sandbox_test`` (exposed only when ``sandbox_enabled`` is true)."""
+
+    def __init__(self, runtime: PluginRuntime) -> None:
+        self.runtime = runtime
+
+    def handlers(self) -> dict[str, Handler]:
+        return {"airflow_sandbox_test": safe_handler(self.sandbox_test, context_aware=True)}
+
+    def available(self) -> bool:
+        """``check_fn``: hide the sandbox tool until it is enabled."""
+        try:
+            return self.runtime.settings().sandbox_enabled
+        except Exception:
+            return False
+
+    def sandbox_test(self, args: dict[str, Any], **context: Any) -> str:
+        settings = self.runtime.settings()
+        dag_id = _require_str(args, "dag_id")
+        patch = args.get("patch")
+        if not isinstance(patch, str) or not patch.strip():
+            raise ToolInputError("'patch' must be a non-empty unified diff.")
+        level = args.get("level", "import")
+        if level not in ("import", "structure", "task"):
+            raise ToolInputError("'level' must be 'import', 'structure' or 'task'.")
+        task_id = args.get("task_id")
+        run_id = args.get("run_id")
+        for name, value in (("task_id", task_id), ("run_id", run_id)):
+            if value is not None and (not isinstance(value, str) or not value.strip()):
+                raise ToolInputError(f"'{name}' must be a non-empty string when provided.")
+        _check_allowed(settings, dag_id)
+        if not self.runtime.sandbox_lock.acquire(blocking=False):
+            raise SandboxError("Another sandbox test is already running; wait for it to finish.")
+        try:
+            runner = SandboxRunner(
+                self.runtime.client(settings),
+                settings,
+                self.runtime.dispatch,
+                session_id=_context_str(context, "session_id"),
+                conversation_id=_context_str(context, "conversation_id"),
+            )
+            result = runner.run(
+                SandboxRequest(
+                    dag_id=dag_id,
+                    patch=patch,
+                    level=level,
+                    task_id=task_id.strip() if isinstance(task_id, str) else None,
+                    run_id=run_id.strip() if isinstance(run_id, str) else None,
+                )
+            )
+        finally:
+            self.runtime.sandbox_lock.release()
+        return ok(**result)

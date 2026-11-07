@@ -1,7 +1,7 @@
 ---
 name: airflow-fix-proposal
 description: Write a fix proposal for a critical Apache Airflow failure — probable cause, suggested correction as a unified diff, risks, and how to verify — for a human to review and apply. Use after airflow-triage classified a failure as critical (code, data, schema, permission or configuration error). The agent proposes; it never patches DAG code itself.
-version: 0.3.0
+version: 0.5.0
 author: Joseph Keita
 license: MIT
 metadata:
@@ -34,10 +34,21 @@ user's language.
 3. **Propose the correction as a unified diff** against the DAG file named in the traceback.
    Keep it minimal and focused on the cause. If you do not have the source, write the diff
    on the lines visible in the traceback and say it must be adapted.
-4. **List the risks**: side effects, data already written by the failed run (idempotency),
+4. **Test it in the sandbox when available** (`airflow_sandbox_test`, hidden when the
+   sandbox is disabled):
+   - always start with `level="import"`, then `level="structure"` with the `task_id`;
+   - if a level fails, read `stages` / `log_excerpt`, fix the diff and test again: do not
+     present a fix that failed;
+   - offer `level="task"` (runs ONE task on a data sample, with `run_id` for input fixtures)
+     only when it adds evidence and the user agrees: it asks for approval and is never
+     allowed for heavy operators;
+   - mind the per-session test budget.
+
+   Report what was tested: "import ✅, structure ✅ (no task added/removed), task not run".
+5. **List the risks**: side effects, data already written by the failed run (idempotency),
    downstream consumers, backfill needs.
-5. **Explain how to verify** before and after deploying (see Verification).
-6. **Say what to re-run after the fix**: only the root task(s), with
+6. **Explain how to verify** before and after deploying (see Verification).
+7. **Say what to re-run after the fix**: only the root task(s), with
    `airflow_clear_tasks(dry_run=true)` first if that tool is available; never the whole DAG.
 
 ## Template
@@ -54,6 +65,9 @@ user's language.
 -    <old line>
 +    <new line>
 ```
+
+### Test en bac à sable
+import ✅ · structure ✅ (<changes or "aucun changement de structure">) · task <✅ / ❌ / non lancé>
 
 ### Risques
 - <risk 1>
@@ -85,6 +99,7 @@ user's language.
 - Do not "fix" a failure by catching and ignoring the exception, or by deleting a data-quality
   check.
 - Never put secrets in the diff; reference Airflow Connections / Variables instead.
+- A sandbox pass is evidence, not a guarantee: it ran without network and on a sample.
 
 ## Verification
 

@@ -30,6 +30,7 @@ from .diagnosis import CRITICAL, TRANSIENT, UNKNOWN, RuleSet, read_and_classify
 logger = logging.getLogger(__name__)
 
 CLEAR_TOOL = "airflow_clear_tasks"
+SANDBOX_TOOL = "airflow_sandbox_test"
 MAX_TASKS_PER_CLEAR = 20
 
 
@@ -129,6 +130,8 @@ def make_pre_tool_call_hook(settings_provider: Callable[[], Settings]) -> Callab
     def pre_tool_call(
         tool_name: str = "", args: dict[str, Any] | None = None, **kwargs: Any
     ) -> dict[str, Any] | None:
+        if tool_name == SANDBOX_TOOL:
+            return _sandbox_decision(settings_provider, args)
         if tool_name != CLEAR_TOOL:
             return None
         try:
@@ -172,6 +175,41 @@ def make_pre_tool_call_hook(settings_provider: Callable[[], Settings]) -> Callab
             }
 
     return pre_tool_call
+
+
+def _sandbox_decision(
+    settings_provider: Callable[[], Settings], args: dict[str, Any] | None
+) -> dict[str, Any] | None:
+    """Sandbox tests: blocked when disabled / outside the allowlist; levels above
+    ``sandbox_max_level`` (e.g. running a task) need human approval."""
+    try:
+        call = args if isinstance(args, dict) else {}
+        settings = settings_provider()
+        if not settings.sandbox_enabled:
+            return {"action": "block", "message": "The airflow-mlops sandbox is disabled."}
+        dag_id = call.get("dag_id")
+        if not isinstance(dag_id, str) or not settings.dag_allowed(dag_id):
+            return {
+                "action": "block",
+                "message": f"DAG {dag_id!r} is outside the airflow-mlops allowlist.",
+            }
+        level = call.get("level", "import")
+        levels = ("import", "structure", "task")
+        if level in levels and levels.index(level) <= levels.index(settings.sandbox_max_level):
+            return None
+        return {
+            "action": "approve",
+            "message": (
+                f"Run a sandbox test at level {level!r} for {dag_id} "
+                f"(task {call.get('task_id')!r}) in a Docker container limited to "
+                f"{settings.sandbox_cpus:g} CPU, {settings.sandbox_memory}, "
+                f"{settings.sandbox_timeout_seconds}s, no network, no secrets."
+            ),
+            "rule_key": f"{SANDBOX_TOOL}:{dag_id}:{level}",
+        }
+    except Exception:
+        logger.exception("airflow-mlops: sandbox guard failed")
+        return {"action": "block", "message": "airflow-mlops sandbox guard failed; blocked."}
 
 
 # ============================================================================ clear action

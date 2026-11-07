@@ -4,13 +4,13 @@ Ce guide explique **ce que l'agent sait faire**, **les outils qu'il utilise** et
 que vous pouvez changer**, sans entrer dans le code. Pour les détails techniques, voir le
 [README](../README.md).
 
-> Version décrite : **0.4.0**. Le bac à sable (§ 6) est **prévu** et pas encore disponible.
+> Version décrite : **0.5.0**.
 
 ---
 
 ## 1. En bref
 
-Le plugin transforme l'agent Hermes en assistant pour **Apache Airflow**. Il sait faire quatre
+Le plugin transforme l'agent Hermes en assistant pour **Apache Airflow**. Il sait faire cinq
 choses :
 
 | Fonction | En une phrase | Modifie Airflow ? |
@@ -19,6 +19,7 @@ choses :
 | 🩺 **Diagnostiquer** | Trouver la tâche à l'origine d'une panne et dire si l'erreur est passagère ou grave | Non |
 | 📊 **Rapporter** | Produire un rapport de santé, toujours dans le même format | Non |
 | 🔁 **Relancer** | Relancer uniquement les tâches en échec, après votre accord | **Oui**, désactivé par défaut |
+| 🧪 **Tester un correctif** | Essayer un correctif dans un conteneur Docker jetable avant de vous le proposer | Non, désactivé par défaut |
 
 **Par défaut, le plugin est en lecture seule** : il ne peut rien modifier dans Airflow.
 
@@ -63,6 +64,7 @@ Vous parlez normalement ; l'agent choisit les bons outils.
 | « Rapport de la semaine » ou `/airflow-report all 7d` | `airflow_build_report` |
 | « Relance la tâche en échec » | `airflow_clear_tasks` : aperçu d'abord, puis votre accord |
 | « Comment corriger cette erreur ? » | skill `airflow-fix-proposal`, qui propose un diff sans l'appliquer |
+| « Vérifie que ton correctif marche » | `airflow_sandbox_test`, qui le teste dans le bac à sable |
 
 **Commande rapide :** `/airflow-report [périmètre] [période]`
 
@@ -97,13 +99,21 @@ Exemples : `/airflow-report`, `/airflow-report train_model 7d`, `/airflow-report
 
 Cet outil est **invisible pour l'agent** tant que `read_only` vaut `true`.
 
+### Bac à sable (ne modifie jamais Airflow)
+
+| Outil | À quoi il sert | Paramètres principaux |
+|---|---|---|
+| `airflow_sandbox_test` | Tester un correctif (diff) dans un conteneur jetable (voir § 6) | `dag_id`, `patch`, `level`, `task_id` |
+
+Cet outil est **invisible pour l'agent** tant que `sandbox_enabled` vaut `false`.
+
 ### Skills (méthodes de travail de l'agent)
 
 | Skill | Rôle |
 |---|---|
 | `airflow-triage` | La méthode de diagnostic : trouver la cause racine, lire les preuves, relancer le minimum |
 | `airflow-report` | La présentation du rapport : résumé, puis les 6 sections, sans chiffre inventé |
-| `airflow-fix-proposal` | La proposition de correctif : cause, diff, risques, vérification. **Jamais appliquée par l'agent.** |
+| `airflow-fix-proposal` | La proposition de correctif : cause, diff, **test en bac à sable**, risques, vérification. **Jamais appliquée par l'agent.** |
 
 ---
 
@@ -178,50 +188,88 @@ apparaît dans la section 5 du rapport.
 
 ---
 
-## 6. Le bac à sable (prévu, pas encore disponible)
+## 6. Le bac à sable
 
 **But :** avant de vous proposer un correctif, l'agent le **teste sur une maquette** dans un
-conteneur Docker jetable, puis vous présente une solution **qui a déjà fonctionné**.
+conteneur Docker jetable. Il vous présente ensuite une solution **qui a déjà fonctionné**, avec
+la preuve. Il n'applique toujours rien en production.
 
 ```mermaid
 flowchart LR
     A[Erreur critique] --> B[Correctif proposé<br/>sous forme de diff]
-    B --> C[Copie du DAG<br/>+ correctif]
+    B --> C[Copie de vos DAGs<br/>+ correctif]
     C --> D[Conteneur Docker jetable<br/>limité, sans réseau]
     D --> E[Niveau 1 : le DAG se charge ?]
     E --> F[Niveau 2 : structure OK ?]
-    F -.->|si demandé| G[Niveau 3 : la tâche tourne<br/>sur un échantillon ?]
+    F -.->|avec votre accord| G[Niveau 3 : la tâche tourne<br/>sur un échantillon ?]
     E --> H[Résultat + preuve]
     F --> H
     G --> H
 ```
 
-**Trois niveaux de test**, du plus léger au plus lourd :
+### Les trois niveaux
 
-| Niveau | Ce qui est vérifié | Coût | Quand |
+| Niveau | Ce qui est vérifié | Coût | Votre accord ? |
 |---|---|---|---|
-| 1. Import | Le DAG corrigé se charge sans erreur | quelques secondes | toujours |
-| 2. Structure | Les tâches et dépendances sont cohérentes | quelques secondes | toujours |
-| 3. Tâche | Seule la tâche corrigée tourne, sur un **petit échantillon** de données | limité (voir ci-dessous) | seulement si vous le demandez et l'acceptez |
+| `import` | Le DAG corrigé se charge sans erreur | quelques secondes | non |
+| `structure` | Les tâches et dépendances, comparées à la production | quelques secondes | non |
+| `task` | **Une seule tâche** tourne, sur un **petit échantillon** | limité | **oui**, toujours demandé (par défaut) |
 
-**Pourquoi ça ne peut pas lancer une tâche trop lourde :**
+Le niveau au-delà duquel votre accord est demandé se règle avec `sandbox_max_level`. La valeur
+par défaut est `structure`.
 
-- **Conteneur bridé** : 1 CPU, 2 Go de mémoire, 5 minutes au maximum (réglables). Au-delà, il
-  est arrêté.
-- **Aucun réseau ni aucun identifiant** : impossible de joindre la production, l'entrepôt de
-  données ou un cluster. Une tâche qui essaierait échoue tout de suite.
-- **Échantillon** : la tâche reçoit `AIRFLOW_SANDBOX=1` et `sample_rows=1000` pour travailler sur
-  peu de données. Il faut adapter vos DAGs pour qu'ils lisent ces paramètres.
-- **Opérateurs lourds exclus du niveau 3** : Spark, Kubernetes, Snowflake, scripts shell…
-  restent aux niveaux 1 et 2.
-- **Budget** : un seul test à la fois, un nombre de tests limité par conversation.
-- **Votre accord** : chaque test passe par la validation de Hermes et figure dans le journal.
-- **Votre code n'est jamais modifié** : le test travaille sur une copie.
+### Pourquoi il ne peut pas lancer une tâche trop lourde
 
-Réglages prévus : voir § 7, « Bac à sable ». Plan détaillé :
-[phase5_sandbox_plan.md](phase5_sandbox_plan.md).
+- **Conteneur bridé** : 1 CPU, 2 Go de mémoire sans swap, 256 processus, 5 minutes au maximum.
+  Tout est réglable. Au-delà, le conteneur est tué et le résultat indique « mémoire » ou
+  « temps » dépassé.
+- **Aucun réseau** (`--network none`) et **aucun identifiant** : impossible de joindre la
+  production, l'entrepôt de données ou un cluster. Une tâche qui essaierait échoue tout de suite.
+- **Système de fichiers en lecture seule**, sauf un `/tmp` limité à 512 Mo.
+- **Opérateurs lourds jamais exécutés** : Spark, Kubernetes, Snowflake, BigQuery, Bash, Docker,
+  SSH… restent aux niveaux `import` et `structure`. La liste est réglable.
+- **Un seul test à la fois**, et au maximum 5 par session Hermes. C'est réglable.
+- **Votre code n'est jamais modifié** : le test travaille sur une copie, supprimée juste après.
+- **Chaque test est journalisé** et apparaît dans le rapport (section 5).
 
----
+### Pour que la tâche travaille sur un échantillon (niveau `task`)
+
+Le conteneur fournit trois variables d'environnement à vos tâches :
+
+| Variable | Valeur | Usage conseillé dans votre DAG |
+|---|---|---|
+| `AIRFLOW_SANDBOX` | `1` | « je suis en test » : ne rien écrire hors de `/tmp` |
+| `AIRFLOW_SANDBOX_SAMPLE_ROWS` | `1000` (réglable) | limiter le volume lu, ex. `LIMIT 1000` ou `df.head(n)` |
+| `AIRFLOW_SANDBOX_FIXTURES` | chemin d'un fichier JSON | les XComs d'entrée du run en échec (masqués), à utiliser à la place de `xcom_pull` |
+
+Exemple :
+```python
+import os
+
+rows = int(os.environ.get("AIRFLOW_SANDBOX_SAMPLE_ROWS", 0)) or None
+df = read_table(limit=rows)  # lit tout en production, 1000 lignes en test
+```
+
+### Mise en place (une seule fois)
+
+1. **Docker** doit tourner sur la machine de Hermes, et le terminal de Hermes doit être local
+   (cas par défaut).
+2. **Construire une image** avec Airflow et les dépendances de vos DAGs. Le conteneur de test
+   n'a pas de réseau et ne peut donc pas faire de `pip install` :
+   ```dockerfile
+   FROM apache/airflow:3.1.0          # même version que votre production
+   COPY requirements.txt /tmp/requirements.txt
+   RUN pip install --no-cache-dir -r /tmp/requirements.txt
+   ```
+   ```bash
+   docker build -t mon-airflow-sandbox:1 .
+   ```
+3. **Activer** dans `config.yaml` :
+   ```yaml
+   sandbox_enabled: true
+   sandbox_image: mon-airflow-sandbox:1
+   sandbox_dags_path: C:/chemin/vers/mes/dags     # copié à chaque test, jamais modifié
+   ```
 
 ## 7. Les réglages modifiables
 
@@ -281,19 +329,20 @@ Ces réglages n'ont d'effet que si `read_only: false`.
 | `auto_retry_max_attempts` | `2` | nombre de relances automatiques par tâche avant de vous demander |
 | `auto_retry_backoff_seconds` | `300` | délai minimal entre deux relances automatiques (doublé à chaque fois) |
 
-### Bac à sable (prévu, phase 5, pas encore actif)
+### Bac à sable
 
-| Réglage prévu | Défaut proposé | Rôle |
+| Réglage | Défaut | À changer quand… |
 |---|---|---|
-| `sandbox_enabled` | `false` | activer les tests en conteneur |
-| `sandbox_image` | — | image Docker Airflow + vos dépendances |
-| `sandbox_dags_path` | — | dossier local de vos DAGs (lu, jamais modifié) |
-| `sandbox_max_level` | `structure` | niveau maximal sans demande explicite (`import`, `structure`, `task`) |
-| `sandbox_cpus` / `sandbox_memory` | `1` / `2g` | limites du conteneur |
-| `sandbox_timeout_seconds` | `300` | durée maximale d'un test |
-| `sandbox_sample_rows` | `1000` | taille de l'échantillon transmis à la tâche |
-| `sandbox_heavy_operators` | Spark, Kubernetes, Snowflake, Bash… | opérateurs jamais exécutés au niveau 3 |
-| `sandbox_max_tests_per_session` | `5` | budget de tests par conversation |
+| `sandbox_enabled` | `false` | vous voulez que l'agent teste ses correctifs → `true` |
+| `sandbox_image` | vide | toujours, si activé : votre image Airflow + dépendances |
+| `sandbox_dags_path` | vide | toujours, si activé : le dossier local de vos DAGs |
+| `sandbox_max_level` | `structure` | `import` pour encore moins d'exécution ; `task` pour ne plus être sollicité au niveau 3 (déconseillé) |
+| `sandbox_cpus` | `1` | vos tâches ont besoin de plus (maximum 8) |
+| `sandbox_memory` | `2g` | de `256m` à `16g` |
+| `sandbox_timeout_seconds` | `300` | de 30 à 540 secondes |
+| `sandbox_sample_rows` | `1000` | taille de l'échantillon proposé à vos tâches |
+| `sandbox_heavy_operators` | Spark, Kubernetes, Databricks, Snowflake, BigQuery, EMR, Bash, Docker, SSH | ajouter vos propres opérateurs lourds |
+| `sandbox_max_tests_per_session` | `5` | budget de tests par session Hermes |
 
 ---
 
@@ -321,4 +370,5 @@ Ces réglages n'ont d'effet que si `read_only: false`.
 | `not_found` | DAG, run ou tâche inexistant | vérifier l'identifiant |
 | `dag_not_allowed` | DAG hors `dag_allowlist` | l'ajouter à la liste si c'est voulu |
 | `guardrail` | une règle de sécurité a refusé la relance | lire le message : il explique quoi faire |
+| `sandbox` | le bac à sable a refusé ou n'a pas pu préparer le test (désactivé, budget, opérateur lourd, diff qui ne s'applique pas) | lire le message |
 | `invalid_argument` | paramètre mal formé | reformuler la demande |

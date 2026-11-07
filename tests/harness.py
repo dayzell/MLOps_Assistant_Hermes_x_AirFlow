@@ -161,6 +161,19 @@ class FakeContext:
     def register_skill(self, name: str, path: Path, description: str = "", **kwargs: Any) -> None:
         self.skills[name] = Path(path)
 
+    # ``dispatch_tool`` stand-in: records the call; ``dispatch_handler`` builds the reply
+    # (by default a successful empty terminal result).
+    dispatched: list[tuple[str, dict[str, Any]]]
+    dispatch_handler: Callable[[str, dict[str, Any]], str] | None = None
+
+    def dispatch_tool(self, tool_name: str, args: dict[str, Any], **kwargs: Any) -> str:
+        if not hasattr(self, "dispatched"):
+            self.dispatched = []
+        self.dispatched.append((tool_name, args))
+        if self.dispatch_handler is not None:
+            return self.dispatch_handler(tool_name, args)
+        return json.dumps({"output": "", "exit_code": 0, "error": None})
+
     def call(self, tool: str, **args: Any) -> dict[str, Any]:
         """Invoke a registered tool like Hermes does and decode its JSON result."""
         raw = self.tools[tool]["handler"](args, task_id="t-1", session_id="s-1")

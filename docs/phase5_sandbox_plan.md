@@ -1,7 +1,16 @@
 # Phase 5 — Plan du bac à sable de test des correctifs
 
-> **Statut : plan seulement, rien n'est implémenté.** Conformément à la guideline, rien ne
-> sera codé sans accord explicite. Les décisions marquées « proposée » sont à confirmer.
+> **Statut : implémenté en v0.5.0** (`sandbox.py`, `sandbox_runner/check_dag.py`, outil
+> `airflow_sandbox_test`), après validation des décisions du § 7.
+>
+> **Écarts par rapport au plan :**
+> - **Échantillon** : il est transmis par variables d'environnement (`AIRFLOW_SANDBOX`,
+>   `AIRFLOW_SANDBOX_SAMPLE_ROWS`, `AIRFLOW_SANDBOX_FIXTURES`) et non par `--task-params`. Ce
+>   drapeau n'est pas garanti identique entre Airflow 2 et 3.
+> - **Fixtures** : les XComs d'entrée sont fournis comme un fichier JSON, et non injectés dans
+>   la base Airflow de la maquette.
+> - **`sandbox_max_level`** : c'est le niveau au-delà duquel la validation humaine est
+>   demandée, via le hook `pre_tool_call`.
 
 ## 1. Objectif
 

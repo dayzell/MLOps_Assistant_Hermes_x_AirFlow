@@ -12,8 +12,8 @@ from typing import Any
 from .config import TOOLSET
 from .guardrails import make_pre_tool_call_hook
 from .runtime import PluginRuntime
-from .schemas import READ_TOOL_SCHEMAS, WRITE_TOOL_SCHEMAS
-from .tools import ReadTools, WriteTools
+from .schemas import READ_TOOL_SCHEMAS, SANDBOX_TOOL_SCHEMAS, WRITE_TOOL_SCHEMAS
+from .tools import ReadTools, SandboxTools, WriteTools
 
 __all__ = ["register"]
 
@@ -50,7 +50,19 @@ def register(ctx: Any) -> None:
             check_fn=writes.available,  # hidden while read_only is true
             description=schema["description"],
         )
-    # Human approval for every real write unless the bounded auto-retry policy allows it.
+    sandbox = SandboxTools(runtime)
+    sandbox_handlers = sandbox.handlers()
+    for name, schema in SANDBOX_TOOL_SCHEMAS.items():
+        ctx.register_tool(
+            name=name,
+            toolset=TOOLSET,
+            schema=schema,
+            handler=sandbox_handlers[name],
+            check_fn=sandbox.available,  # hidden while sandbox_enabled is false
+            description=schema["description"],
+        )
+    # Human approval for every real write unless the bounded auto-retry policy allows it,
+    # and for sandbox tests above sandbox_max_level.
     ctx.register_hook("pre_tool_call", make_pre_tool_call_hook(runtime.settings))
 
     ctx.register_command(
