@@ -9,15 +9,17 @@ from __future__ import annotations
 import functools
 import json
 import logging
-from collections import Counter, deque
+from collections import Counter
 from collections.abc import Callable
 from typing import Any
 
 from .airflow_client import AirflowError
 from .config import Settings
+from .diagnosis import RunDiagnoser, load_rules
 from .redaction import redact_text, redact_value
 from .runtime import PluginRuntime
 from .textutils import excerpt_log, truncate_text, truncate_value
+from .views import build_dependency_view, collect_xcoms
 
 logger = logging.getLogger(__name__)
 
@@ -138,6 +140,7 @@ class ReadTools:
             "airflow_get_task_logs": safe_handler(self.get_task_logs),
             "airflow_get_xcoms": safe_handler(self.get_xcoms),
             "airflow_get_dependencies": safe_handler(self.get_dependencies),
+            "airflow_diagnose_run": safe_handler(self.diagnose_run),
         }
 
     # -- airflow_list_dags
@@ -265,44 +268,22 @@ class ReadTools:
             raise ToolInputError("'key' must be a non-empty string when provided.")
         map_index = _optional_int(args, "map_index", None, -1)
 
-        client = self.runtime.client(settings)
-        entries = client.list_xcom_entries(
+        results, entries_truncated = collect_xcoms(
+            self.runtime.client(settings),
             dag_id,
             run_id,
             task_id,
+            max_chars=settings.xcom_max_chars,
             key=key.strip() if isinstance(key, str) else None,
             map_index=map_index,
-            max_items=_MAX_XCOM_ENTRIES,
+            max_entries=_MAX_XCOM_ENTRIES,
         )
-        results: list[dict[str, Any]] = []
-        for entry in entries:
-            entry_key = str(entry.get("key"))
-            entry_map_index = entry.get("map_index", map_index)
-            item: dict[str, Any] = {
-                "key": entry_key,
-                "map_index": entry_map_index,
-                "timestamp": entry.get("timestamp"),
-            }
-            try:
-                value = client.get_xcom_value(
-                    dag_id,
-                    run_id,
-                    task_id,
-                    entry_key,
-                    entry_map_index if isinstance(entry_map_index, int) else None,
-                )
-                masked = redact_value({entry_key: value})[entry_key]
-                item["value"], item["truncated"] = truncate_value(masked, settings.xcom_max_chars)
-            except AirflowError as exc:
-                item["value"], item["truncated"] = None, False
-                item["error"] = exc.to_dict()
-            results.append(item)
         return ok(
             dag_id=dag_id,
             run_id=run_id,
             task_id=task_id,
             count=len(results),
-            entries_truncated=len(entries) >= _MAX_XCOM_ENTRIES,
+            entries_truncated=entries_truncated,
             xcoms=results,
         )
 
@@ -319,52 +300,13 @@ class ReadTools:
             return error("not_found", f"Task '{task_id}' does not exist in DAG '{dag_id}'.", 404)
         return ok(dag_id=dag_id, depth=depth, **graph)
 
-
-def build_dependency_view(
-    tasks: list[dict[str, Any]], task_id: str, depth: int
-) -> dict[str, Any] | None:
-    """Upstream/downstream neighbourhood of ``task_id`` (BFS, ``depth`` hops each way)."""
-    by_id = {str(task["task_id"]): task for task in tasks if task.get("task_id")}
-    if task_id not in by_id:
-        return None
-    downstream: dict[str, list[str]] = {
-        tid: [str(d) for d in task.get("downstream_task_ids") or []] for tid, task in by_id.items()
-    }
-    upstream: dict[str, list[str]] = {tid: [] for tid in by_id}
-    for tid, children in downstream.items():
-        for child in children:
-            upstream.setdefault(child, []).append(tid)
-
-    def walk(edges: dict[str, list[str]]) -> list[dict[str, Any]]:
-        seen: dict[str, int] = {}
-        queue: deque[tuple[str, int]] = deque([(task_id, 0)])
-        while queue:
-            current, distance = queue.popleft()
-            if distance >= depth:
-                continue
-            for neighbour in edges.get(current, []):
-                if neighbour not in seen and neighbour != task_id:
-                    seen[neighbour] = distance + 1
-                    queue.append((neighbour, distance + 1))
-        return [
-            {
-                "task_id": tid,
-                "distance": dist,
-                "trigger_rule": by_id.get(tid, {}).get("trigger_rule"),
-                "operator": by_id.get(tid, {}).get("operator"),
-                "direct_upstream": upstream.get(tid, []),
-            }
-            for tid, dist in sorted(seen.items(), key=lambda kv: (kv[1], kv[0]))
-        ]
-
-    task = by_id[task_id]
-    return {
-        "task": {
-            "task_id": task_id,
-            "operator": task.get("operator"),
-            "trigger_rule": task.get("trigger_rule"),
-            "retries": task.get("retries"),
-        },
-        "upstream": walk(upstream),
-        "downstream": walk(downstream),
-    }
+    # -- airflow_diagnose_run
+    def diagnose_run(self, args: dict[str, Any]) -> str:
+        settings = self.runtime.settings()
+        dag_id = _require_str(args, "dag_id")
+        run_id = _require_str(args, "run_id")
+        _check_allowed(settings, dag_id)
+        diagnoser = RunDiagnoser(
+            self.runtime.client(settings), settings, load_rules(settings.error_patterns_path)
+        )
+        return ok(**diagnoser.diagnose(dag_id, run_id))

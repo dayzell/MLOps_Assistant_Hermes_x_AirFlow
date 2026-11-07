@@ -3,8 +3,10 @@
 Plugin **Hermes Agent** autonome qui transforme l'agent en assistant MLOps pour **Apache Airflow** :
 surveillance des DAGs, diagnostic de pannes, relance ciblée et protégée, rapports de monitoring normés.
 
-> **État : Phase 1** — squelette, client REST v1/v2, 7 outils en lecture seule, redaction, tests.
-> Diagnostic (phase 2), rapports + skills (phase 3) et remédiation protégée (phase 4) arrivent ensuite.
+> **État : Phase 2 (v0.2.0)**
+> - Fait : 7 outils en lecture seule, redaction, et diagnostic de panne avec classification
+>   transient / critical.
+> - À venir : rapports + skills (phase 3), remédiation protégée (phase 4).
 
 ## Installation
 
@@ -55,7 +57,7 @@ Les secrets sont saisis à l'installation (`hermes plugins install`) et lus excl
 | `auto_remediation_enabled` | `false` | Relance auto des erreurs transitoires (phase 4) |
 | `auto_retry_max_attempts` | `2` | Tentatives auto max par `(dag_id, run_id, task_id)` |
 | `auto_retry_backoff_seconds` | `300` | Backoff de base (doublé à chaque tentative) |
-| `error_patterns_path` | `""` | Règles de classification personnalisées (phase 2) |
+| `error_patterns_path` | `""` | Fichier de règles de classification personnalisé (voir « Diagnostic ») |
 
 Exemple (`~/.hermes/config.yaml`) :
 
@@ -86,9 +88,70 @@ n'exposent jamais de traceback.
 | `airflow_get_task_logs` | Log d'un try : tail borné et bloc d'erreur/traceback extrait |
 | `airflow_get_xcoms` | XComs d'une tâche, masqués et tronqués |
 | `airflow_get_dependencies` | Graphe amont/aval d'une tâche avec `trigger_rule` |
+| `airflow_diagnose_run` | Diagnostic complet d'un run en échec : racine vs impactées, logs, XComs, classification justifiée |
 
 Types d'erreur : `invalid_argument`, `dag_not_allowed`, `config`, `auth`, `forbidden`,
 `not_found`, `bad_request`, `timeout`, `network`, `server`, `http`, `internal`.
+
+## Diagnostic (`airflow_diagnose_run`)
+
+L'outil agrège en un seul appel les éléments nécessaires pour interpréter une panne.
+
+**Structure du run**
+
+- `root_failures` : tâches `failed` sans aucun ancêtre en échec. Ce sont les causes racines.
+- `secondary_failures` : tâches `failed` qui ont un ancêtre en échec, par exemple une tâche
+  `trigger_rule: all_done` qui échoue à cause de la racine.
+- `impacted` : tâches `upstream_failed` / `skipped`, avec `caused_by`, la ou les racines
+  responsables. Un `skipped` sans racine en amont est signalé comme possiblement volontaire
+  (branchement).
+- `retrying` : tâches `up_for_retry`.
+
+**Pour chaque racine**
+
+- le bloc d'erreur ou traceback extrait ;
+- la fin du log ;
+- les XComs de la tâche et de ses producteurs amont directs, masqués et tronqués ;
+- ses dépendances avec leur `trigger_rule` ;
+- sa **classification**.
+
+**Résumé**
+
+- `category` ;
+- `retry_candidates` : racines `transient` uniquement ;
+- `requires_human` ;
+- `guidance`.
+
+Les paramètres du DAG sont joints, masqués. L'interprétation en langage naturel reste le travail
+du LLM, guidé par la skill `airflow-triage` (phase 3).
+
+### Classification
+
+Les règles sont dans [data/error_patterns.yaml](data/error_patterns.yaml) : expressions
+régulières et mots-clés, avec un `id`, une `category` et une `description`.
+
+| Catégorie | Exemples |
+|---|---|
+| `transient` | timeout, connexion reset ou refusée, HTTP 429/502/503/504, pool saturé, timeout de sensor, DNS / verrou de base de données, zombie / SIGTERM |
+| `critical` | SyntaxError, ImportError, KeyError / TypeError…, incohérence de schéma, échec d'un contrôle qualité, permission, connexion ou variable manquante, OOM récurrent |
+| `unknown` | aucune règle ne correspond : revue humaine |
+
+Fonctionnement :
+
+- **Zone analysée** : le bloc d'erreur est analysé d'abord. La fin du log n'est utilisée que si le
+  bloc d'erreur ne correspond à aucune règle.
+- **Priorité** : une règle `critical` l'emporte toujours. Les signaux `transient` restent listés
+  pour la transparence.
+- **`min_tries` et `below_min_tries_category`** : ces champs gèrent les erreurs récurrentes. Un
+  premier OOM est `transient`, un OOM à partir du 2e essai est `critical`.
+- **Justification** : chaque classification renvoie une `justification` et les `matched_rules`
+  (règle, extrait de la ligne fautive, source).
+- **Règles personnalisées** : `error_patterns_path` pointe vers votre propre fichier, au même
+  format. S'il est illisible ou vide, le plugin revient aux règles livrées et le signale dans
+  `rules_warnings`.
+
+Les classifications sont mises en cache dans la base SQLite du plugin (`plugin_db`). Le
+mécanisme d'approbation de la phase 4 s'appuie sur ce cache.
 
 ## Convention XCom « qualité des données »
 
@@ -121,8 +184,9 @@ chiffres. Exemple dans [demo-local-airflow/dags/mlops_demo.py](demo-local-airflo
   - valeurs des clés sensibles dans les dictionnaires.
 - **Allowlist** de DAGs : un DAG hors allowlist est refusé avant tout appel à Airflow.
 - **Tailles bornées** : logs (lignes et caractères) et XComs.
-- **Aucune écriture** dans le dossier du plugin. L'état durable (phases 2 à 4) ira dans
-  `plugin_data_dir("airflow-mlops")` / `plugin_db()`.
+- **Aucune écriture** dans le dossier du plugin. L'état durable (cache de diagnostic, et plus
+  tard journal et compteurs) est dans `plugin_db("airflow-mlops")`. Son schéma est versionné par
+  `PRAGMA user_version`.
 - **Divulgation (règle 13 du catalogue)** : le plugin appelle l'API REST du serveur Airflow
   configuré, et rien d'autre. Il ne lance ni commande shell ni processus d'arrière-plan.
 

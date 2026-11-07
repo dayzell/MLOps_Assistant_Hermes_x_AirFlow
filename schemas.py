@@ -174,6 +174,24 @@ AIRFLOW_GET_DEPENDENCIES: dict[str, Any] = {
     },
 }
 
+AIRFLOW_DIAGNOSE_RUN: dict[str, Any] = {
+    "name": "airflow_diagnose_run",
+    "description": (
+        "Diagnose a failed or retrying DAG run in one call. Separates root failures (failed "
+        "tasks with no failed upstream) from secondary failures and impacted tasks "
+        "(upstream_failed / skipped). For each root failure it returns the error block, a log "
+        "tail, XComs of the task and its inputs, its dependencies, and a classification "
+        "(transient / critical / unknown) with the matched rules as justification. Also "
+        "returns DAG params (secrets masked), retry candidates and guidance. Read-only. "
+        "Start every failure investigation with this tool, then follow the airflow-triage skill."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {"dag_id": _DAG_ID, "run_id": _RUN_ID},
+        "required": ["dag_id", "run_id"],
+    },
+}
+
 READ_TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
     schema["name"]: schema
     for schema in (
@@ -184,5 +202,6 @@ READ_TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
         AIRFLOW_GET_TASK_LOGS,
         AIRFLOW_GET_XCOMS,
         AIRFLOW_GET_DEPENDENCIES,
+        AIRFLOW_DIAGNOSE_RUN,
     )
 }

@@ -385,6 +385,9 @@ class AirflowClient:
         raw = self._paginate(f"/dags/{_seg(dag_id)}/dagRuns", "dag_runs", params, max_items=limit)
         return [self._normalize_run(run) for run in raw]
 
+    def get_dag_run(self, dag_id: str, run_id: str) -> dict[str, Any]:
+        return self._normalize_run(self._get_json(f"/dags/{_seg(dag_id)}/dagRuns/{_seg(run_id)}"))
+
     @staticmethod
     def _normalize_run(raw: dict[str, Any]) -> dict[str, Any]:
         duration = raw.get("duration")
