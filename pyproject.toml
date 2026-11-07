@@ -1,0 +1,39 @@
+[project]
+name = "airflow-mlops"
+version = "0.1.0"
+description = "Hermes Agent plugin: Apache Airflow monitoring, diagnosis, targeted retries and reports"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.11"
+# Runtime dependencies only (installed by Hermes' plugin manager). Upper bounds on each:
+# httpx is pre-1.0, so it is bounded to the next minor release.
+dependencies = [
+    "httpx>=0.27,<0.29",
+    "PyYAML>=6.0,<7",
+]
+# Development tools live in requirements-dev.txt on purpose: Hermes' plugin manager installs
+# optional-dependencies / dependency-groups too, and users must not receive test tooling.
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "--import-mode=importlib -q"
+pythonpath = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+extend-exclude = [".venv", "demo-local-airflow"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "SIM", "RUF"]
+ignore = ["RUF001", "RUF002", "RUF003"]  # French text / typographic quotes in prose
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+exclude = ["^\\.venv/", "^tests/", "^demo-local-airflow/"]
+
+[[tool.mypy.overrides]]
+# Hermes host modules: only available inside Hermes (stubbed in tests).
+module = ["agent.*", "plugins.*"]
+ignore_missing_imports = true
