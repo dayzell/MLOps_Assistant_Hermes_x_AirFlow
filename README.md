@@ -8,7 +8,11 @@ surveillance des DAGs, diagnostic de pannes, relance ciblée et protégée, rapp
 >   transient / critical, rapports normés, commande `/airflow-report`, 3 skills, et
 >   remédiation protégée (relance ciblée, approbation humaine, politique de relance
 >   automatique, journal d'audit).
-> - Phase 5 (optionnelle) : plan du bac à sable de test des correctifs.
+> - Phase 5 (optionnelle) : plan du bac à sable de test des correctifs
+>   ([docs/phase5_sandbox_plan.md](docs/phase5_sandbox_plan.md)), non implémenté.
+
+📘 **Vue d'ensemble simple des fonctionnalités, des outils et des réglages :
+[docs/GUIDE_UTILISATEUR.md](docs/GUIDE_UTILISATEUR.md).** Ce README est la référence technique.
 
 ## Installation
 
