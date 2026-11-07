@@ -513,6 +513,56 @@ class AirflowClient:
         body = self._get_json(path, params or None)
         return body.get("value") if isinstance(body, dict) else body
 
+    # ------------------------------------------------------------------ remediation
+
+    def clear_task_instances(
+        self,
+        dag_id: str,
+        run_id: str,
+        task_ids: list[str],
+        *,
+        dry_run: bool,
+        only_failed: bool,
+        include_downstream: bool,
+    ) -> list[dict[str, Any]]:
+        """``POST /dags/{dag_id}/clearTaskInstances`` restricted to ONE run and explicit tasks.
+
+        Scope-widening options are hard-coded off: no upstream, no past/future runs, no date
+        range. ``reset_dag_runs`` puts the (failed) run back in a runnable state so the
+        scheduler picks the cleared tasks up; tasks that are not cleared keep their state.
+        Never retried automatically (not idempotent).
+        """
+        if not task_ids:
+            raise AirflowError("guardrail", "Refusing to clear: task_ids is empty.")
+        body = {
+            "dry_run": dry_run,
+            "dag_run_id": run_id,
+            "task_ids": list(task_ids),
+            "only_failed": only_failed,
+            "only_running": False,
+            "include_upstream": False,
+            "include_downstream": include_downstream,
+            "include_future": False,
+            "include_past": False,
+            "reset_dag_runs": True,
+        }
+        response = self._request("POST", f"/dags/{_seg(dag_id)}/clearTaskInstances", json_body=body)
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            raise AirflowError("server", "Airflow returned non-JSON content for clear.") from exc
+        items = (payload.get("task_instances") or []) if isinstance(payload, dict) else []
+        return [
+            {
+                "task_id": item.get("task_id"),
+                "map_index": item.get("map_index", -1),
+                "run_id": item.get("dag_run_id") or item.get("run_id") or run_id,
+                "state": item.get("state"),
+            }
+            for item in items
+            if isinstance(item, dict)
+        ]
+
 
 def flatten_log_content(content: Any) -> str:
     """Normalise the log payload of both API versions to plain text.

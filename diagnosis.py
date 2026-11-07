@@ -305,6 +305,51 @@ def _describe(matches: list[RuleMatch]) -> str:
     return "; ".join(parts)
 
 
+@dataclass(frozen=True)
+class TaskEvidence:
+    """Log excerpt and classification of the latest try of one task instance."""
+
+    classification: Classification
+    error_block: str | None = None
+    log_tail: str | None = None
+    log_error: dict[str, Any] | None = None
+
+
+def read_and_classify(
+    client: AirflowClient,
+    settings: Settings,
+    ruleset: RuleSet,
+    dag_id: str,
+    run_id: str,
+    ti: dict[str, Any],
+) -> TaskEvidence:
+    """Fetch the latest try's log of ``ti`` (secret-masked, bounded) and classify it."""
+    task_id = str(ti["task_id"])
+    map_index = ti.get("map_index", -1)
+    map_arg = map_index if isinstance(map_index, int) and map_index >= 0 else None
+    try_number = int(ti.get("try_number") or 0)
+    if try_number < 1:
+        return TaskEvidence(
+            classify(None, None, ruleset),
+            log_error={"type": "not_found", "message": "task never started"},
+        )
+    try:
+        text = redact_text(client.get_task_log(dag_id, run_id, task_id, try_number, map_arg))
+    except AirflowError as exc:
+        return TaskEvidence(classify(None, None, ruleset), log_error=exc.to_dict())
+    excerpt = excerpt_log(
+        text,
+        max_lines=settings.log_max_lines,
+        max_chars=settings.log_max_chars,
+        context_lines=settings.error_context_lines,
+    )
+    return TaskEvidence(
+        classify(excerpt.error_block, excerpt.tail, ruleset, try_number),
+        error_block=excerpt.error_block,
+        log_tail=excerpt.tail,
+    )
+
+
 # ============================================================================ run diagnosis
 
 
@@ -455,29 +500,13 @@ class RunDiagnoser:
             "downstream": [graph.describe(t) for t in graph.downstream.get(task_id, [])],
         }
 
-        error_block: str | None = None
-        log_tail: str | None = None
-        if try_number >= 1:
-            try:
-                text = redact_text(
-                    self.client.get_task_log(dag_id, run_id, task_id, int(try_number), map_arg)
-                )
-                full = excerpt_log(
-                    text,
-                    max_lines=self.settings.log_max_lines,
-                    max_chars=self.settings.log_max_chars,
-                    context_lines=self.settings.error_context_lines,
-                )
-                error_block, log_tail = full.error_block, full.tail
-                detail["log_tail"] = "\n".join(full.tail.splitlines()[-_LOG_TAIL_LINES:])
-            except AirflowError as exc:
-                detail["log_error"] = exc.to_dict()
-        else:
-            detail["log_error"] = {"type": "not_found", "message": "task never started"}
-        detail["error_block"] = error_block
-
-        classification = classify(error_block, log_tail, self.ruleset, try_number or None)
-        detail["classification"] = classification.to_dict()
+        evidence = read_and_classify(self.client, self.settings, self.ruleset, dag_id, run_id, ti)
+        if evidence.log_tail is not None:
+            detail["log_tail"] = "\n".join(evidence.log_tail.splitlines()[-_LOG_TAIL_LINES:])
+        if evidence.log_error is not None:
+            detail["log_error"] = evidence.log_error
+        detail["error_block"] = evidence.error_block
+        detail["classification"] = evidence.classification.to_dict()
         detail["xcoms"] = self._xcoms(dag_id, run_id, task_id, map_arg, graph)
         return detail
 

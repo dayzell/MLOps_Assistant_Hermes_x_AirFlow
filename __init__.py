@@ -10,9 +10,10 @@ from pathlib import Path
 from typing import Any
 
 from .config import TOOLSET
+from .guardrails import make_pre_tool_call_hook
 from .runtime import PluginRuntime
-from .schemas import READ_TOOL_SCHEMAS
-from .tools import ReadTools
+from .schemas import READ_TOOL_SCHEMAS, WRITE_TOOL_SCHEMAS
+from .tools import ReadTools, WriteTools
 
 __all__ = ["register"]
 
@@ -25,7 +26,7 @@ SKILLS: dict[str, str] = {
 
 
 def register(ctx: Any) -> None:
-    """Hermes entry point: register the Airflow tools, the slash command and the skills."""
+    """Hermes entry point: register tools, the approval hook, the slash command and skills."""
     runtime = PluginRuntime(ctx)
     tools = ReadTools(runtime)
     handlers = tools.handlers()
@@ -37,6 +38,20 @@ def register(ctx: Any) -> None:
             handler=handlers[name],
             description=schema["description"],
         )
+
+    writes = WriteTools(runtime)
+    write_handlers = writes.handlers()
+    for name, schema in WRITE_TOOL_SCHEMAS.items():
+        ctx.register_tool(
+            name=name,
+            toolset=TOOLSET,
+            schema=schema,
+            handler=write_handlers[name],
+            check_fn=writes.available,  # hidden while read_only is true
+            description=schema["description"],
+        )
+    # Human approval for every real write unless the bounded auto-retry policy allows it.
+    ctx.register_hook("pre_tool_call", make_pre_tool_call_hook(runtime.settings))
 
     ctx.register_command(
         "airflow-report",

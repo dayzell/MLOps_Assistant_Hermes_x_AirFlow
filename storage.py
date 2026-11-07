@@ -19,9 +19,23 @@ from plugins.plugin_storage import plugin_db
 
 from .config import PLUGIN_NAME
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 _MIGRATIONS: dict[int, list[str]] = {
+    3: [
+        # Retries performed by the plugin, per task instance (auto-retry limit and backoff).
+        """
+        CREATE TABLE IF NOT EXISTS retry_counters (
+            dag_id          TEXT NOT NULL,
+            run_id          TEXT NOT NULL,
+            task_id         TEXT NOT NULL,
+            attempts        INTEGER NOT NULL,
+            auto_attempts   INTEGER NOT NULL,
+            last_attempt_at REAL NOT NULL,
+            PRIMARY KEY (dag_id, run_id, task_id)
+        )
+        """,
+    ],
     2: [
         # Per-task duration baselines used by reports to compute trends.
         """
@@ -341,3 +355,63 @@ def list_audit_entries(
             }
         )
     return entries
+
+
+# ---------------------------------------------------------------------------- retry counters
+
+
+@dataclass(frozen=True)
+class RetryState:
+    attempts: int = 0
+    auto_attempts: int = 0
+    last_attempt_at: float | None = None
+
+
+def get_retry_state(dag_id: str, run_id: str, task_id: str) -> RetryState:
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT attempts, auto_attempts, last_attempt_at FROM retry_counters "
+            "WHERE dag_id = ? AND run_id = ? AND task_id = ?",
+            (dag_id, run_id, task_id),
+        ).fetchone()
+    if row is None:
+        return RetryState()
+    return RetryState(int(row[0]), int(row[1]), float(row[2]))
+
+
+def record_retry(
+    dag_id: str, run_id: str, task_ids: list[str], *, auto: bool, now: float | None = None
+) -> dict[str, RetryState]:
+    """Count one plugin-initiated retry for each task; returns the new states."""
+    timestamp = time.time() if now is None else now
+    states: dict[str, RetryState] = {}
+    with connect() as conn:
+        for task_id in task_ids:
+            conn.execute(
+                """
+                INSERT INTO retry_counters
+                    (dag_id, run_id, task_id, attempts, auto_attempts, last_attempt_at)
+                VALUES (?, ?, ?, 1, ?, ?)
+                ON CONFLICT (dag_id, run_id, task_id) DO UPDATE SET
+                    attempts = attempts + 1,
+                    auto_attempts = auto_attempts + excluded.auto_attempts,
+                    last_attempt_at = excluded.last_attempt_at
+                """,
+                (dag_id, run_id, task_id, int(auto), timestamp),
+            )
+            row = conn.execute(
+                "SELECT attempts, auto_attempts, last_attempt_at FROM retry_counters "
+                "WHERE dag_id = ? AND run_id = ? AND task_id = ?",
+                (dag_id, run_id, task_id),
+            ).fetchone()
+            states[task_id] = RetryState(int(row[0]), int(row[1]), float(row[2]))
+    return states
+
+
+def update_audit_entry(entry_id: int, *, outcome: str, details: dict[str, Any] | None) -> None:
+    """Complete a journal entry written before a write action (``pending`` -> outcome)."""
+    with connect() as conn:
+        conn.execute(
+            "UPDATE audit_log SET outcome = ?, details = ? WHERE id = ?",
+            (outcome, json.dumps(details or {}, default=str)[:4000], entry_id),
+        )

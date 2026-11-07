@@ -16,6 +16,7 @@ from typing import Any
 from .airflow_client import AirflowError
 from .config import DagNotAllowedError, Settings
 from .diagnosis import RunDiagnoser, load_rules
+from .guardrails import ClearRequest, ClearTasksAction, GuardrailError
 from .redaction import redact_text, redact_value
 from .reporting import ReportBuilder, parse_period, parse_scope
 from .runtime import PluginRuntime
@@ -47,17 +48,24 @@ def error(error_type: str, message: str, status: int | None = None) -> str:
     )
 
 
-def safe_handler(func: Callable[[dict[str, Any]], str]) -> Handler:
-    """Wrap a handler so that it always returns JSON and never raises."""
+def safe_handler(func: Callable[..., str], *, context_aware: bool = False) -> Handler:
+    """Wrap a handler so that it always returns JSON and never raises.
+
+    ``context_aware`` handlers also receive Hermes' context kwargs (session_id, ...).
+    """
 
     @functools.wraps(func)
     def wrapper(args: dict[str, Any] | None = None, **kwargs: Any) -> str:
         try:
             if args is not None and not isinstance(args, dict):
                 raise ToolInputError("Arguments must be a JSON object.")
+            if context_aware:
+                return func(args or {}, **kwargs)
             return func(args or {})
         except ToolInputError as exc:
             return error("invalid_argument", str(exc))
+        except GuardrailError as exc:
+            return error("guardrail", str(exc))
         except DagNotAllowedError as exc:
             return error("dag_not_allowed", str(exc), 403)
         except AirflowError as exc:
@@ -352,3 +360,63 @@ def parse_command_args(raw_args: str | None) -> tuple[str, str | None]:
         else:
             scope = token
     return scope, period
+
+
+class WriteTools:
+    """Remediation tools (exposed only when ``read_only`` is false)."""
+
+    def __init__(self, runtime: PluginRuntime) -> None:
+        self.runtime = runtime
+
+    def handlers(self) -> dict[str, Handler]:
+        return {"airflow_clear_tasks": safe_handler(self.clear_tasks, context_aware=True)}
+
+    def available(self) -> bool:
+        """``check_fn``: hide write tools in read-only mode."""
+        try:
+            return not self.runtime.settings().read_only
+        except Exception:
+            return False
+
+    # -- airflow_clear_tasks
+    def clear_tasks(self, args: dict[str, Any], **context: Any) -> str:
+        settings = self.runtime.settings()
+        dag_id = _require_str(args, "dag_id")
+        run_id = _require_str(args, "run_id")
+        task_ids = _optional_str_list(args, "task_ids")
+        if not task_ids:
+            raise ToolInputError("'task_ids' must list at least one task (never a whole DAG).")
+        _check_allowed(settings, dag_id)
+        reason = args.get("reason") or ""
+        if not isinstance(reason, str):
+            raise ToolInputError("'reason' must be a string.")
+        flags: dict[str, bool] = {}
+        for name, default in (
+            ("include_downstream", False),
+            ("only_failed", True),
+            ("dry_run", True),
+            ("confirm_critical", False),
+        ):
+            value = _optional_bool(args, name)
+            flags[name] = default if value is None else value
+        request = ClearRequest(
+            dag_id=dag_id,
+            run_id=run_id,
+            task_ids=list(dict.fromkeys(task_ids)),
+            reason=reason.strip(),
+            **flags,
+        )
+        action = ClearTasksAction(
+            self.runtime.client(settings), settings, load_rules(settings.error_patterns_path)
+        )
+        result = action.run(
+            request,
+            session_id=_context_str(context, "session_id"),
+            conversation_id=_context_str(context, "conversation_id"),
+        )
+        return ok(**result)
+
+
+def _context_str(context: dict[str, Any], key: str) -> str | None:
+    value = context.get(key)
+    return str(value) if value not in (None, "") else None

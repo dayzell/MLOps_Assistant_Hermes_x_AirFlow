@@ -238,3 +238,57 @@ READ_TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
         AIRFLOW_BUILD_REPORT,
     )
 }
+
+
+AIRFLOW_CLEAR_TASKS: dict[str, Any] = {
+    "name": "airflow_clear_tasks",
+    "description": (
+        "Re-run (clear) specific failed task instances of ONE DAG run - never a whole DAG. "
+        "Defaults to dry_run=true: returns the exact task instances that would be cleared, "
+        "without changing anything. Always dry-run first and show the list to the user. A real "
+        "clear (dry_run=false) needs a 'reason', goes through human approval (unless the "
+        "bounded auto-retry policy for transient failures applies) and is journaled. Failures "
+        "classified critical are refused unless confirm_critical=true after explicit human "
+        "confirmation. Retry only the root failures listed by airflow_diagnose_run."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "dag_id": _DAG_ID,
+            "run_id": _RUN_ID,
+            "task_ids": {
+                "type": "array",
+                "items": {"type": "string"},
+                "minItems": 1,
+                "maxItems": 20,
+                "description": "Explicit task ids to clear (the root failures). Required.",
+            },
+            "include_downstream": {
+                "type": "boolean",
+                "description": "Also clear downstream tasks (default false; Airflow re-runs "
+                "upstream_failed downstream tasks once the root succeeds).",
+            },
+            "only_failed": {
+                "type": "boolean",
+                "description": "Only clear task instances in a failed state (default true).",
+            },
+            "dry_run": {
+                "type": "boolean",
+                "description": "Preview only (default true). Set false only after the user "
+                "agreed with the previewed list.",
+            },
+            "reason": {
+                "type": "string",
+                "description": "Why this retry is needed (required when dry_run=false; journaled).",
+            },
+            "confirm_critical": {
+                "type": "boolean",
+                "description": "Allow retrying a failure classified critical. Only set after "
+                "a human explicitly confirmed it (default false).",
+            },
+        },
+        "required": ["dag_id", "run_id", "task_ids"],
+    },
+}
+
+WRITE_TOOL_SCHEMAS: dict[str, dict[str, Any]] = {AIRFLOW_CLEAR_TASKS["name"]: AIRFLOW_CLEAR_TASKS}

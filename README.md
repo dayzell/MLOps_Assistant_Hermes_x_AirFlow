@@ -3,10 +3,12 @@
 Plugin **Hermes Agent** autonome qui transforme l'agent en assistant MLOps pour **Apache Airflow** :
 surveillance des DAGs, diagnostic de pannes, relance ciblée et protégée, rapports de monitoring normés.
 
-> **État : Phase 3 (v0.3.0)**
+> **État : Phase 4 (v0.4.0)**
 > - Fait : outils en lecture seule, redaction, diagnostic de panne avec classification
->   transient / critical, rapports normés, commande `/airflow-report` et 3 skills.
-> - À venir : remédiation protégée (phase 4).
+>   transient / critical, rapports normés, commande `/airflow-report`, 3 skills, et
+>   remédiation protégée (relance ciblée, approbation humaine, politique de relance
+>   automatique, journal d'audit).
+> - Phase 5 (optionnelle) : plan du bac à sable de test des correctifs.
 
 ## Installation
 
@@ -47,14 +49,14 @@ Les secrets sont saisis à l'installation (`hermes plugins install`) et lus excl
 | `max_retries` | `2` | Relances des lectures sur erreur réseau / 502 / 503 / 504 |
 | `page_size` | `100` | Taille de page (plafonnée par `[api] maximum_page_limit`) |
 | `dag_allowlist` | `["*"]` | Motifs glob des DAGs accessibles ; tout autre DAG est refusé |
-| `read_only` | `true` | Masque les outils d'écriture (phase 4) |
+| `read_only` | `true` | Masque et refuse les outils d'écriture (`airflow_clear_tasks`) |
 | `log_max_lines` / `log_max_chars` | `200` / `20000` | Bornes des logs renvoyés au LLM |
 | `error_context_lines` | `40` | Taille max du bloc d'erreur extrait |
 | `xcom_max_chars` | `2000` | Taille max d'une valeur XCom renvoyée |
 | `data_quality_xcom_key` | `data_quality` | Clé XCom de la convention qualité (voir plus bas) |
 | `sla_thresholds` | `{}` | Seuils SLA en secondes : `{"dag_id": 3600, "dag_id.task_id": 600}` |
 | `report_default_period` | `24h` | Période par défaut des rapports |
-| `auto_remediation_enabled` | `false` | Relance auto des erreurs transitoires (phase 4) |
+| `auto_remediation_enabled` | `false` | Relance auto, sans approbation, des erreurs transitoires (bornée, voir « Remédiation ») |
 | `auto_retry_max_attempts` | `2` | Tentatives auto max par `(dag_id, run_id, task_id)` |
 | `auto_retry_backoff_seconds` | `300` | Backoff de base (doublé à chaque tentative) |
 | `error_patterns_path` | `""` | Fichier de règles de classification personnalisé (voir « Diagnostic ») |
@@ -90,6 +92,7 @@ n'exposent jamais de traceback.
 | `airflow_get_dependencies` | Graphe amont/aval d'une tâche avec `trigger_rule` |
 | `airflow_diagnose_run` | Diagnostic complet d'un run en échec : racine vs impactées, logs, XComs, classification justifiée |
 | `airflow_build_report` | Rapport de monitoring normé (6 sections, JSON + Markdown) |
+| `airflow_clear_tasks` | **Écriture.** Relance ciblée de tâches d'un run (dry run par défaut, protégée) ; masquée si `read_only: true` |
 
 Types d'erreur : `invalid_argument`, `dag_not_allowed`, `config`, `auth`, `forbidden`,
 `not_found`, `bad_request`, `timeout`, `network`, `server`, `http`, `internal`.
@@ -199,6 +202,71 @@ Elles sont enregistrées via `ctx.register_skill` et accessibles sous le nom
 | `airflow-report` | Présentation du rapport normé : résumé exécutif, puis les 6 sections inchangées. Aucun chiffre inventé. |
 | `airflow-fix-proposal` | Proposition de correctif pour une erreur critique : cause probable, diff, risques, vérification. L'agent propose, il n'applique jamais de patch. |
 
+## Remédiation protégée (`airflow_clear_tasks`)
+
+`airflow_clear_tasks(dag_id, run_id, task_ids, include_downstream=false, only_failed=true,
+dry_run=true, reason, confirm_critical=false)` relance **uniquement** les task instances
+nécessaires d'**un** run. L'outil n'est exposé que si `read_only: false`.
+
+### Garde-fous codés en dur
+
+Aucun réglage ne permet de les désactiver.
+
+| Règle | Comportement |
+|---|---|
+| `task_ids` vide | refusé ; il n'existe pas de « clear » de DAG entier |
+| DAG entier | refusé si les tâches demandées, ou le résultat après `include_downstream`, couvrent toutes les tâches du DAG (DAG de 2 tâches ou plus) |
+| Portée | un seul run (`dag_run_id`) ; jamais d'amont, de passé, de futur ni de plage de dates ; 20 tâches au maximum |
+| `dry_run=true` par défaut | renvoie la liste exacte calculée par le *dry run* d'Airflow, sans rien modifier |
+| Erreur `critical` | relance réelle refusée sans `confirm_critical=true` ; le dry run reste possible, avec un avertissement |
+| `reason` | obligatoire pour une relance réelle ; elle est journalisée |
+| Allowlist / `read_only` | vérifiés dans l'outil **et** dans le hook |
+
+La classification utilisée est celle du diagnostic en cache. À défaut, le dernier essai de la
+tâche est classé à la volée. Une relance réelle commence toujours par un *dry run* Airflow.
+Elle utilise ensuite `reset_dag_runs=true`, pour que le run en échec redevienne exécutable par
+le scheduler : seules les tâches relancées sont ré-exécutées, les autres gardent leur état.
+
+### Validation humaine
+
+Le hook `pre_tool_call` intercepte chaque appel de `airflow_clear_tasks` avec `dry_run=false` :
+
+- DAG hors allowlist ou mode `read_only` : `{"action": "block"}` ;
+- sinon `{"action": "approve", "message": <résumé>, "rule_key": "airflow_clear_tasks:<dag>:<run>"}`,
+  qui envoie l'appel vers la **validation humaine de Hermes** (once / session / always / deny) ;
+- seule exception : la politique de relance automatique ci-dessous l'autorise ;
+- si le hook plante, l'appel est bloqué.
+
+Sans humain disponible (cron, gateway sans pont d'approbation), Hermes refuse l'action.
+
+### Politique de relance automatique (désactivée par défaut)
+
+Avec `auto_remediation_enabled: true`, une relance réelle passe **sans** validation humaine
+seulement si toutes ces conditions sont remplies :
+
+1. chaque tâche a un diagnostic en cache classé `transient` (lancer `airflow_diagnose_run` d'abord) ;
+2. `only_failed=true` ;
+3. moins de `auto_retry_max_attempts` relances automatiques ont déjà eu lieu pour
+   `(dag_id, run_id, task_id)`. Le compteur est persisté dans `plugin_db()` ;
+4. le backoff est écoulé : `auto_retry_backoff_seconds × 2^(n-1)` après la n-ième relance
+   automatique.
+
+Au-delà, l'appel repasse par la validation humaine : **escalade, jamais de boucle**.
+
+### Journal d'audit
+
+Chaque appel est enregistré dans la table `audit_log` de `plugin_db()`. Cela couvre les dry
+runs, les refus, les relances et les erreurs Airflow. Chaque entrée contient :
+
+- **qui** : `session_id` / `conversation_id` Hermes ;
+- **quoi** : DAG, run, tâches, options, task instances touchées ;
+- **quand** : horodatage ;
+- **pourquoi** : `reason` ;
+- le mode (manuel ou automatique) et le résultat.
+
+Une relance réelle est d'abord journalisée comme `pending`. **Si le journal est indisponible,
+la relance est refusée.** Le rapport (section 5) affiche ces actions.
+
 ## Convention XCom « qualité des données »
 
 Airflow n'a pas de notion native de qualité des données. Le rapport lit la convention
@@ -233,8 +301,12 @@ chiffres. Exemple dans [demo-local-airflow/dags/mlops_demo.py](demo-local-airflo
 - **Aucune écriture** dans le dossier du plugin. L'état durable (cache de diagnostic, et plus
   tard journal et compteurs) est dans `plugin_db("airflow-mlops")`. Son schéma est versionné par
   `PRAGMA user_version`.
-- **Divulgation (règle 13 du catalogue)** : le plugin appelle l'API REST du serveur Airflow
-  configuré, et rien d'autre. Il ne lance ni commande shell ni processus d'arrière-plan.
+- **Divulgation (règle 13 du catalogue)** : le plugin appelle uniquement l'API REST du serveur
+  Airflow configuré. Il ne lance ni commande shell ni processus d'arrière-plan.
+  - Il ne **modifie** Airflow que par `airflow_clear_tasks`. Cet outil est désactivé par défaut
+    (`read_only: true`), passe par la validation humaine de Hermes et est journalisé.
+  - La relance automatique sans validation est une option explicite
+    (`auto_remediation_enabled`), bornée aux erreurs transitoires.
 
 ## Développement
 
