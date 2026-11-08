@@ -144,7 +144,10 @@ Toujours les **mêmes 6 sections, dans le même ordre**, pour pouvoir comparer d
 l'autre :
 
 1. **Périmètre et période** : quels DAGs, quelle fenêtre de temps.
-2. **Santé globale** : nombre de runs, taux de succès, incidents.
+2. **Santé globale** : un **statut par DAG** (sain, dégradé, en échec), puis un statut global
+   **expliqué** : il nomme les DAGs en cause et la raison. Un seul DAG en difficulté parmi
+   plusieurs DAGs sains ne met pas tout en échec. On y trouve aussi le nombre de runs, le taux
+   de succès et les incidents.
 3. **Performance** : durée de chaque tâche comparée à sa durée habituelle, relances, attente,
    SLA.
 4. **Qualité des données** : lue depuis un XCom `data_quality` publié par vos DAGs (voir le

@@ -199,7 +199,13 @@ def test_report_has_the_fixed_shape_and_metrics(
     assert health["total_runs"] == 6  # the 30-day-old run is excluded
     assert health["failed"] == 1 and health["success"] == 5
     assert health["success_rate"] == pytest.approx(5 / 6, abs=1e-4)
-    assert health["status"] == "failing"  # 83 % < 90 %
+    # per-DAG statuses; global = derived from DAGs (1 of 2 failing -> half -> failing)
+    statuses = {d["dag_id"]: (d["status"], d["status_reason"]) for d in health["per_dag"]}
+    assert statuses["train"] == ("healthy", "aucun incident")
+    assert statuses["etl"] == ("failing", "dernier run en échec")
+    assert health["dag_status_counts"] == {"failing": 1, "degraded": 0, "healthy": 1, "no_data": 0}
+    assert health["status"] == "failing"
+    assert health["status_reason"] == "1 DAG(s) sur 2 en échec : etl (dernier run en échec)"
     assert health["incidents"] == 1
 
     tasks = {(t["dag_id"], t["task_id"]): t for t in report["performance"]["tasks"]}
@@ -411,10 +417,77 @@ def test_masked_failures_in_success_runs(
     report = result["report"]
     assert report["health"]["masked_failures"] == 1
     assert report["health"]["incidents"] == 1
-    assert report["health"]["status"] == "degraded"
+    # the latest run hides a failed task: this DAG is broken right now
+    assert report["health"]["status"] == "failing"
+    assert report["health"]["per_dag"][0]["status_reason"].startswith("échec masqué")
     masked = report["incidents"]["failed_runs"][0]
     assert masked["masked"] is True and masked["failed_tasks"] == ["train"]
     assert report["incidents"]["masked_run_count"] == 1
     assert report["recommendations"][0]["severity"] == "high"
     assert "trigger_rule" in report["recommendations"][0]["message"]
     assert "échec masqué" in result["markdown"]
+
+
+def test_one_recovered_dag_among_several_is_only_degraded(
+    api_version: str, airflow: respx.MockRouter, ctx: FakeContext
+) -> None:
+    """DAGs are independent: an old failure on one DAG, now recovered, must not make the
+    whole platform 'failing'; the reason names the DAG concerned."""
+    airflow.get("/dags").respond(
+        json=collection("dags", [p.dag(api_version, d) for d in ("a", "b", "c")])
+    )
+    airflow.get("/dags/a/dagRuns").respond(
+        json=collection("dag_runs", [run("a2", "success", 1), run("a1", "failed", 5)])
+    )
+    for dag_id in ("b", "c"):
+        airflow.get(f"/dags/{dag_id}/dagRuns").respond(
+            json=collection("dag_runs", [run(f"{dag_id}1", "success", 2)])
+        )
+    airflow.get(path__regex=r".*/taskInstances$").respond(
+        json=collection("task_instances", [ti("t", "success", 1.0)])
+    )
+    airflow.get(path__regex=r".*/xcomEntries$").respond(json=collection("xcom_entries", []))
+    result = ctx.call("airflow_build_report", period="24h")
+    health = result["report"]["health"]
+    assert health["status"] == "degraded"
+    assert health["status_reason"].startswith("1 DAG(s) dégradé(s) : a (1 incident(s)")
+    assert "🟠 degraded" in result["markdown"]
+    assert "- Statut : **degraded** — 1 DAG(s) dégradé(s)" in result["markdown"]
+
+
+def test_section5_lists_each_run_under_its_own_heading(
+    api_version: str, airflow: respx.MockRouter, ctx: FakeContext
+) -> None:
+    """Found in a real report: a failed run was listed under the masked-runs heading."""
+    airflow.get("/dags").respond(
+        json=collection("dags", [p.dag(api_version, "a"), p.dag(api_version, "b")])
+    )
+    airflow.get("/dags/a/dagRuns").respond(json=collection("dag_runs", [run("a1", "failed", 1)]))
+    airflow.get("/dags/b/dagRuns").respond(json=collection("dag_runs", [run("b1", "success", 2)]))
+    airflow.get("/dags/a/dagRuns/a1/taskInstances").respond(
+        json=collection("task_instances", [ti("fetch", "failed", 1.0)])
+    )
+    airflow.get("/dags/b/dagRuns/b1/taskInstances").respond(
+        json=collection(
+            "task_instances", [ti("train", "failed", 1.0), ti("notify", "success", 1.0)]
+        )
+    )
+    airflow.get(path__regex=r".*/xcomEntries$").respond(json=collection("xcom_entries", []))
+    storage.add_audit_entry(
+        tool="airflow_sandbox_test",
+        dag_id="b",
+        run_id=None,
+        task_ids=[],
+        dry_run=True,
+        auto=False,
+        reason="",
+        outcome="passed",
+    )
+    markdown = ctx.call("airflow_build_report", period="24h")["markdown"]
+    section = markdown.split("## 5.")[1].split("## 6.")[0]
+    lines = [line for line in section.splitlines() if line.strip()]
+    failed_at = next(i for i, line in enumerate(lines) if line.startswith("- Runs en échec"))
+    masked_at = next(i for i, line in enumerate(lines) if "masquent un échec" in line)
+    assert "a / a1" in lines[failed_at + 1]
+    assert "b / b1" in lines[masked_at + 1]
+    assert "airflow_sandbox_test b (bac à sable)" in section  # no double space

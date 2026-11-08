@@ -31,7 +31,8 @@ evidence-based reading. Reply in the user's language.
   → `report` (JSON, six fixed keys) + `markdown` (fixed template).
 - Sections, in this exact order:
   1. Périmètre et période — `scope_period`
-  2. Santé globale — `health` (status, runs, success rate, incidents, per-DAG table)
+  2. Santé globale — `health` (per-DAG `status` + `status_reason`, global `status` +
+     `status_reason` derived from the DAGs, runs, success rate, incidents)
   3. Performance par tâche — `performance` (p50/p95, baseline, trend, retries, queue, SLA)
   4. Qualité des données — `data_quality` (XCom convention `data_quality`)
   5. Incidents et actions — `incidents` (failed runs, cached diagnosis, audit log actions)
@@ -41,8 +42,10 @@ evidence-based reading. Reply in the user's language.
 
 1. Call `airflow_build_report` with the scope and period the user asked for (default: the
    configured period). If the scope is unclear, use `all`.
-2. Start your answer with a 2–3 line **executive summary**: health status, success rate,
-   number of incidents, the single most important recommendation.
+2. Start your answer with a 2–3 line **executive summary**: the global status **with its
+   reason** (`health.status_reason`: which DAGs, why), number of incidents, the single most
+   important recommendation. Never give a bare status: DAGs are independent, so say which
+   ones are affected and which are healthy.
 3. Then output the tool's `markdown` **as is** (all six sections, same headings, same order).
    Do not drop empty sections: an empty section still says "aucun" / "non configuré" /
    "non instrumenté".

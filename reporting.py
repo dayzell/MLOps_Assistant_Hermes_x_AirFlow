@@ -294,11 +294,15 @@ class ReportBuilder:
                 totals[state] += count
             durations = [r["duration_s"] for r in item.runs if r.get("duration_s") is not None]
             finished = counts["success"] + counts["failed"]
-            masked = len(item.masked_runs())
+            masked_runs = item.masked_runs()
+            masked = len(masked_runs)
             totals["masked"] += masked
+            status, reason = _dag_status(item, counts["failed"], masked_runs)
             per_dag.append(
                 {
                     "dag_id": item.dag_id,
+                    "status": status,
+                    "status_reason": reason,
                     "is_paused": item.dag.get("is_paused"),
                     "runs": len(item.runs),
                     "success": counts["success"],
@@ -316,16 +320,11 @@ class ReportBuilder:
         finished = totals["success"] + totals["failed"]
         rate = totals["success"] / finished if finished else None
         incidents = totals["failed"] + totals["masked"]
-        if total_runs == 0:
-            status = "no_data"
-        elif incidents == 0:
-            status = "healthy"
-        elif totals["failed"] == 0 or (rate is not None and rate >= 0.9):
-            status = "degraded"
-        else:
-            status = "failing"
+        status, reason, status_counts = _global_status(per_dag)
         return {
             "status": status,
+            "status_reason": reason,
+            "dag_status_counts": status_counts,
             "total_runs": total_runs,
             "success": totals["success"],
             "failed": totals["failed"],
@@ -743,6 +742,66 @@ class ReportBuilder:
         return recs
 
 
+# ============================================================================ health status
+
+STATUS_ORDER = ("failing", "degraded", "healthy", "no_data")
+
+
+def _dag_status(
+    item: _DagData, failed_runs: int, masked_runs: list[dict[str, Any]]
+) -> tuple[str, str]:
+    """Status of ONE DAG from its own runs, with a human-readable reason.
+
+    failing  = the DAG is broken right now (latest run failed, or its latest "success" run
+               hides a failed task); degraded = incidents in the period but the latest run is
+               clean; healthy = no incident; no_data = no run in the period.
+    """
+    if not item.runs:
+        return "no_data", "aucun run sur la période"
+    latest = item.runs[0]
+    if latest.get("state") == "failed":
+        return "failing", "dernier run en échec"
+    if any(str(run["run_id"]) == str(latest.get("run_id")) for run in masked_runs):
+        return "failing", "échec masqué dans le dernier run, pourtant marqué success"
+    incidents = failed_runs + len(masked_runs)
+    if incidents:
+        return "degraded", f"{incidents} incident(s) sur la période, dernier run sans échec"
+    return "healthy", "aucun incident"
+
+
+def _global_status(per_dag: list[dict[str, Any]]) -> tuple[str, str, dict[str, int]]:
+    """Global status derived from the per-DAG statuses (DAGs are independent).
+
+    failing  = at least half of the DAGs with runs are failing; degraded = at least one DAG
+    failing or degraded; healthy = none. The reason names the DAGs concerned.
+    """
+    counts = {status: 0 for status in STATUS_ORDER}
+    for dag in per_dag:
+        counts[dag["status"]] += 1
+    with_data = len(per_dag) - counts["no_data"]
+    failing = [d for d in per_dag if d["status"] == "failing"]
+    degraded = [d for d in per_dag if d["status"] == "degraded"]
+
+    def names(dags: list[dict[str, Any]]) -> str:
+        shown = ", ".join(f"{d['dag_id']} ({d['status_reason']})" for d in dags[:5])
+        return shown + (f", +{len(dags) - 5}" if len(dags) > 5 else "")
+
+    if with_data == 0:
+        return "no_data", "aucun run sur la période", counts
+    parts = []
+    if failing:
+        parts.append(f"{len(failing)} DAG(s) sur {with_data} en échec : {names(failing)}")
+    if degraded:
+        parts.append(f"{len(degraded)} DAG(s) dégradé(s) : {names(degraded)}")
+    if failing and len(failing) * 2 >= with_data:
+        status = "failing"
+    elif failing or degraded:
+        status = "degraded"
+    else:
+        return "healthy", f"aucun incident sur les {with_data} DAG(s) avec des runs", counts
+    return status, " ; ".join(parts), counts
+
+
 # ============================================================================ markdown
 
 
@@ -796,7 +855,11 @@ def render_markdown(report: dict[str, Any]) -> str:
         "",
         f"## {SECTION_TITLES['health']}",
         "",
-        f"- Statut : **{health['status']}**",
+        f"- Statut : **{health['status']}** — {health['status_reason']}",
+        f"- DAGs : {health['dag_status_counts']['healthy']} sain(s), "
+        f"{health['dag_status_counts']['degraded']} dégradé(s), "
+        f"{health['dag_status_counts']['failing']} en échec, "
+        f"{health['dag_status_counts']['no_data']} sans run",
         f"- Runs : {health['total_runs']} (succès {health['success']}, échecs {health['failed']}, "
         f"autres {health['other']})",
         f"- Taux de succès : {_fmt_rate(health['success_rate'])}",
@@ -806,12 +869,18 @@ def render_markdown(report: dict[str, Any]) -> str:
     if health["per_dag"]:
         lines += [
             "",
-            "| DAG | Runs | Succès | Échecs | Taux | Durée p50 | Durée p95 | Dernier état |",
-            "|---|---|---|---|---|---|---|---|",
+            "| DAG | Statut | Runs | Succès | Échecs | Taux | Durée p50 | Durée p95 "
+            "| Dernier état |",
+            "|---|---|---|---|---|---|---|---|---|",
         ]
+        icons = {"healthy": "✅", "degraded": "🟠", "failing": "🔴", "no_data": "—"}
         for dag in health["per_dag"]:
+            status_cell = f"{icons[dag['status']]} {dag['status']}"
+            if dag["status"] in ("degraded", "failing"):
+                status_cell += f" ({_cell(dag['status_reason'])})"
             lines.append(
-                f"| {_cell(dag['dag_id'])} | {dag['runs']} | {dag['success']} | {dag['failed']} "
+                f"| {_cell(dag['dag_id'])} | {status_cell} | {dag['runs']} | {dag['success']} "
+                f"| {dag['failed']} "
                 f"| {_fmt_rate(dag['success_rate'])} | {_fmt_s(dag['run_duration_p50_s'])} "
                 f"| {_fmt_s(dag['run_duration_p95_s'])} | {dag['last_run_state'] or '—'} |"
             )
@@ -877,11 +946,9 @@ def render_markdown(report: dict[str, Any]) -> str:
         "",
         f"## {SECTION_TITLES['incidents']}",
         "",
-        f"- Runs en échec : {incidents['failed_run_count']}",
     ]
-    if incidents.get("masked_run_count"):
-        lines.append(f"- Runs « success » masquant des échecs : {incidents['masked_run_count']}")
-    for run in incidents["failed_runs"][:20]:
+
+    def run_line(run: dict[str, Any]) -> str:
         tasks = ", ".join(run["failed_tasks"]) if run["failed_tasks"] else "?"
         diagnosis = run.get("diagnosis")
         diag = (
@@ -889,8 +956,17 @@ def render_markdown(report: dict[str, Any]) -> str:
             if diagnosis
             else ""
         )
-        flag = " ⚠️ run marqué success (échec masqué)" if run.get("masked") else ""
-        lines.append(f"  - {run['dag_id']} / {run['run_id']} : tâches {tasks}{diag}{flag}")
+        return f"  - {run['dag_id']} / {run['run_id']} : tâches en échec {tasks}{diag}"
+
+    # Each run under its own heading: real failures first, then masked ones.
+    shown = incidents["failed_runs"][:20]
+    lines.append(f"- Runs en échec : {incidents['failed_run_count']}")
+    lines += [run_line(r) for r in shown if not r.get("masked")]
+    if incidents.get("masked_run_count"):
+        lines.append(
+            f"- ⚠️ Runs marqués « success » qui masquent un échec : {incidents['masked_run_count']}"
+        )
+        lines += [run_line(r) for r in shown if r.get("masked")]
     if incidents["actions"]:
         lines.append(f"- Actions prises : {len(incidents['actions'])}")
         for action in incidents["actions"][:20]:
@@ -900,9 +976,11 @@ def render_markdown(report: dict[str, Any]) -> str:
                 mode = "aperçu"
             else:
                 mode = "auto" if action["auto"] else "manuel"
+            target = " ".join(
+                part for part in (action["dag_id"], ", ".join(action["task_ids"])) if part
+            )
             lines.append(
-                f"  - {action['ts']} {action['tool']} {action['dag_id']} "
-                f"{', '.join(action['task_ids'])} ({mode}) → {action['outcome']}"
+                f"  - {action['ts']} {action['tool']} {target} ({mode}) → {action['outcome']}"
             )
     else:
         lines.append("- Actions prises : aucune")

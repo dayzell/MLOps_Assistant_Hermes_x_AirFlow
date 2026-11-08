@@ -229,6 +229,7 @@ réelles d'entreprise, tenez compte du fait que les échanges passent par leurs 
 | « Hermes needs at least 64,000 tokens » | `ollama_num_ctx` trop petit | `ollama_num_ctx: 65536` (étape 2) |
 | `Title generation failed: Request timed out` dans `logs/agent.log` | rechargements du modèle | `OLLAMA_CONTEXT_LENGTH=65536`, puis redémarrer Ollama (étape 3) |
 | `ollama ps` affiche `CONTEXT 4096` | variables non prises en compte | redémarrer **complètement** Ollama, y compris l'icône de la barre des tâches |
+| Une modification du plugin (code, skills) n'est pas prise en compte, même après avoir relancé `hermes chat` | le plugin est chargé par la **passerelle** de Hermes, qui tourne en arrière-plan, et non par le chat | `hermes gateway restart`, ou quitter puis rouvrir l'application Hermes |
 | L'agent répond sans appeler d'outil, ou invente des DAGs | outils du plugin cachés derrière `tool_search` (journal : « 0 core/visible tools kept, 9 deferred ») | `tools.tool_search.enabled: off` et `-t airflow` (étape 2) ; vérifier que la réponse cite de vrais noms de DAGs |
 | Pendant la réponse : carte graphique peu utilisée, ~9 Go de RAM pris par `ollama.exe` | modèle et contexte de 64k trop gros pour 6 Go de mémoire graphique : le calcul se fait surtout sur le processeur (~3 tokens/s) | normal sur cette machine ; voir « Performances » |
 | `ollama: command not found` dans Git Bash (VS Code) | PATH réécrit par l'extension Python | utiliser PowerShell, ou relancer la fenêtre VS Code |
@@ -329,13 +330,28 @@ Il renvoie un JSON (`report`, avec 6 clés fixes) et un Markdown (`markdown`, ga
 | # | Section | Contenu |
 |---|---|---|
 | 1 | Périmètre et période | DAGs couverts, fenêtre UTC, DAGs échantillonnés ou illisibles |
-| 2 | Santé globale | statut (`healthy` / `degraded` / `failing` / `no_data`), runs, taux de succès, incidents, tableau par DAG |
+| 2 | Santé globale | **un statut par DAG** avec sa raison, et un statut global **expliqué** (voir ci-dessous), runs, taux de succès, incidents |
 | 3 | Performance par tâche | durées p50 / p95, ligne de base et tendance, retries, temps d'attente en file p50 / p95, SLA manqués |
 | 4 | Qualité des données | lue uniquement depuis la convention XCom ci-dessous ; sinon « non instrumenté » |
 | 5 | Incidents et actions | runs en échec, tâches en échec, diagnostic en cache, actions du journal d'audit |
 | 6 | Recommandations | règles simples (échecs, lenteur > +25 %, retries, file d'attente, SLA, qualité), triées par gravité |
 
 **Comment les chiffres sont calculés**
+
+- **Statut d'un DAG**, calculé sur ses propres runs, car les DAGs sont indépendants :
+  - `failing` : il est cassé **maintenant**. Son dernier run a échoué, ou il cache une tâche en
+    échec alors qu'il est marqué success ;
+  - `degraded` : il a eu des incidents sur la période, mais son dernier run est sain ;
+  - `healthy` : aucun incident ;
+  - `no_data` : aucun run sur la période.
+- **Statut global**, déduit des statuts des DAGs, et non des runs mélangés :
+  - `failing` si **au moins la moitié** des DAGs avec des runs sont en échec ;
+  - `degraded` si au moins un DAG a un problème ;
+  - `healthy` sinon.
+
+  Il est toujours suivi de sa **raison** : par exemple « 2 DAG(s) sur 3 en échec : … », avec
+  le nom de chaque DAG concerné et son motif. Un seul DAG en difficulté parmi plusieurs DAGs
+  sains donne donc `degraded`, pas `failing`.
 
 - **Ligne de base** : stockée dans `plugin_db()` par couple `(dag_id, task_id)`. Elle est mise à
   jour à chaque rapport par moyenne mobile exponentielle, avec un poids de 30 % pour les
