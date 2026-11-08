@@ -41,6 +41,10 @@ logger = logging.getLogger(__name__)
 TOOL_NAME = "airflow_sandbox_test"
 RUNNER_SOURCE = Path(__file__).resolve().parent / "sandbox_runner" / "check_dag.py"
 SENTINEL = "SANDBOX_RESULT "
+_NETWORK_ERROR = re.compile(
+    r"Temporary failure in name resolution|Name or service not known|Network is unreachable"
+    r"|Connection refused|getaddrinfo failed|nodename nor servname"
+)
 CONTAINER_ROOT = "/sandbox"
 
 MAX_COPY_FILES = 2000
@@ -238,6 +242,26 @@ def copy_dags_folder(source: Path, destination: Path) -> int:
     return count
 
 
+STALE_WORKSPACE_SECONDS = 3600
+
+
+def purge_stale_workspaces(root: Path, max_age_s: float = STALE_WORKSPACE_SECONDS) -> int:
+    """Remove workspaces older than ``max_age_s`` (left behind when the process was killed
+    mid-test, so its ``finally`` cleanup never ran). Returns how many were removed."""
+    if not root.is_dir():
+        return 0
+    cutoff = time.time() - max_age_s
+    removed = 0
+    for entry in root.iterdir():
+        try:
+            if entry.is_dir() and not entry.is_symlink() and entry.stat().st_mtime < cutoff:
+                shutil.rmtree(entry, ignore_errors=True)
+                removed += 1
+        except OSError:
+            continue
+    return removed
+
+
 def host_path(path: Path) -> str:
     """Path as Docker on the host expects it (``C:/x/y`` on Windows, ``/x/y`` elsewhere)."""
     return path.resolve().as_posix()
@@ -291,6 +315,8 @@ def build_docker_command(
         "AIRFLOW__CORE__LOAD_EXAMPLES=False",
         "-e",
         "AIRFLOW__CORE__UNIT_TEST_MODE=False",
+        "-e",
+        "AIRFLOW__LOGGING__COLORED_CONSOLE_LOG=False",
         "-e",
         f"PYTHONPATH={CONTAINER_ROOT}/dags",
         "-e",
@@ -350,6 +376,26 @@ def parse_terminal_result(raw: str, settings: Settings) -> dict[str, Any]:
 
     if parsed is not None:
         result.update(passed=bool(parsed.get("passed")), stages=parsed.get("stages", {}))
+        task_stage = result["stages"].get("task") if isinstance(result["stages"], dict) else None
+        if isinstance(task_stage, dict) and not task_stage.get("passed"):
+            task_output = str(task_stage.get("output") or "")
+            if task_stage.get("exit_code") in (-9, 137):
+                result["oom"] = True
+                result["error"] = (
+                    "The task was killed: it exceeded the sandbox memory limit "
+                    f"({settings.sandbox_memory}). Reduce the data volume (sample) or raise "
+                    "sandbox_memory if the task legitimately needs more."
+                )
+            elif task_stage.get("timed_out"):
+                result["timed_out"] = True
+                result["error"] = "The task exceeded the sandbox time limit."
+            elif _NETWORK_ERROR.search(task_output):
+                result["hint"] = (
+                    "The task tried to reach the network, which the sandbox never allows. This "
+                    "is a sandbox limitation, not necessarily a bug in the fix: feed the task "
+                    "from AIRFLOW_SANDBOX_FIXTURES / AIRFLOW_SANDBOX_SAMPLE_ROWS, or rely on the "
+                    "'import' and 'structure' levels for this task."
+                )
     else:
         result.update(passed=False, stages={})
         if exit_code in (137, -9):
@@ -470,7 +516,9 @@ class SandboxRunner:
                     "'import' or 'structure' level instead."
                 )
 
-        workspace = plugin_data_dir(PLUGIN_NAME) / "sandbox" / uuid.uuid4().hex[:12]
+        sandbox_root = plugin_data_dir(PLUGIN_NAME) / "sandbox"
+        purge_stale_workspaces(sandbox_root)  # leftovers of an interrupted process
+        workspace = sandbox_root / uuid.uuid4().hex[:12]
         try:
             dags_copy = workspace / "dags"
             dags_copy.mkdir(parents=True)

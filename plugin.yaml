@@ -171,7 +171,12 @@ config_schema:
       - BashOperator
       - DockerOperator
       - SSHOperator
-    description: Operators never executed at the 'task' level (import/structure checks only).
+      - "@task.bash"
+      - "@task.docker"
+      - "@task.kubernetes"
+      - "@task.virtualenv"
+      - "@task.external_python"
+    description: Operators (or TaskFlow decorators, as Airflow reports them) never executed at the 'task' level.
   sandbox_max_tests_per_session:
     type: int
     default: 5

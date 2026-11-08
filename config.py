@@ -69,6 +69,11 @@ DEFAULTS: dict[str, Any] = {
         "BashOperator",
         "DockerOperator",
         "SSHOperator",
+        "@task.bash",
+        "@task.docker",
+        "@task.kubernetes",
+        "@task.virtualenv",
+        "@task.external_python",
     ],
     "sandbox_max_tests_per_session": 5,
 }

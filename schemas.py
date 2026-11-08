@@ -265,8 +265,10 @@ AIRFLOW_CLEAR_TASKS: dict[str, Any] = {
             },
             "include_downstream": {
                 "type": "boolean",
-                "description": "Also clear downstream tasks (default false; Airflow re-runs "
-                "upstream_failed downstream tasks once the root succeeds).",
+                "description": "Also clear the downstream tasks (default true). With "
+                "only_failed=true this re-runs only the downstream tasks blocked by the failure "
+                "(upstream_failed), never one that succeeded. Without it they stay "
+                "upstream_failed and the run stays failed.",
             },
             "only_failed": {
                 "type": "boolean",

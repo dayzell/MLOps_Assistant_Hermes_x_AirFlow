@@ -3,7 +3,9 @@
 Safety model for ``airflow_clear_tasks``:
 
 * Hard-coded in the handler (cannot be configured away): explicit non-empty ``task_ids``,
-  one run only, never the whole DAG, ``dry_run=True`` by default, a ``reason`` for real
+  one run only, never a whole-DAG re-run of tasks that already succeeded, ``dry_run=True``
+  by default (``only_failed`` + ``include_downstream`` re-run the root and the tasks it
+  blocked, never a succeeded task), a ``reason`` for real
   clears, ``critical`` failures refused without ``confirm_critical=true``, DAG allowlist,
   ``read_only`` mode.
 * Human approval: the ``pre_tool_call`` hook escalates every real clear to Hermes' approval
@@ -110,8 +112,8 @@ def _summary(args: dict[str, Any]) -> str:
     tasks = args.get("task_ids")
     task_text = ", ".join(str(t) for t in tasks) if isinstance(tasks, list) else "?"
     options = []
-    if args.get("include_downstream"):
-        options.append("+downstream")
+    if args.get("include_downstream", True) is False:
+        options.append("root task(s) only")
     if args.get("only_failed", True) is False:
         options.append("including non-failed tasks")
     if args.get("confirm_critical"):
@@ -220,7 +222,7 @@ class ClearRequest:
     dag_id: str
     run_id: str
     task_ids: list[str]
-    include_downstream: bool = False
+    include_downstream: bool = True
     only_failed: bool = True
     dry_run: bool = True
     reason: str = ""
@@ -304,13 +306,18 @@ class ClearTasksAction:
             raise GuardrailError(
                 f"Unknown task(s) in DAG '{request.dag_id}': {', '.join(unknown)}."
             )
-        if len(dag_tasks) > 1 and set(request.task_ids) >= dag_tasks:
+        if not request.only_failed and len(dag_tasks) > 1 and set(request.task_ids) >= dag_tasks:
             raise GuardrailError(
-                "Refusing to clear every task of the DAG: re-running a whole DAG is never done "
-                "by this plugin. Clear only the failed root task(s)."
+                "Refusing to re-run every task of the DAG including the ones that succeeded: "
+                "re-running a whole DAG is never done by this plugin. Clear only the failed root "
+                "task(s) with only_failed=true."
             )
+        states = {
+            str(ti["task_id"]): str(ti.get("state") or "")
+            for ti in self.client.list_task_instances(request.dag_id, request.run_id)
+        }
 
-        classification = self._classifications(request)
+        classification = self._classifications(request, states)
         critical = sorted(t for t, c in classification.items() if c == CRITICAL)
         if critical and not request.confirm_critical and not request.dry_run:
             raise GuardrailError(
@@ -329,10 +336,11 @@ class ClearTasksAction:
             include_downstream=request.include_downstream,
         )
         cleared_ids = {str(ti["task_id"]) for ti in preview}
-        if len(dag_tasks) > 1 and cleared_ids >= dag_tasks:
+        rerun_succeeded = sorted(t for t in cleared_ids if states.get(t) == "success")
+        if len(dag_tasks) > 1 and cleared_ids >= dag_tasks and rerun_succeeded:
             raise GuardrailError(
-                "Refusing: with these options the whole DAG would be re-run "
-                f"({len(cleared_ids)} tasks). Drop include_downstream or clear fewer tasks."
+                "Refusing: with these options the whole DAG would be re-run, including tasks "
+                f"that already succeeded ({', '.join(rerun_succeeded)}). Use only_failed=true."
             )
 
         base: dict[str, Any] = {
@@ -342,6 +350,7 @@ class ClearTasksAction:
             "include_downstream": request.include_downstream,
             "only_failed": request.only_failed,
             "classification": classification,
+            "rerun_succeeded_tasks": rerun_succeeded,
             "auto_policy": {
                 "allowed": decision.allowed,
                 "reason": decision.reason,
@@ -393,7 +402,7 @@ class ClearTasksAction:
             only_failed=request.only_failed,
             include_downstream=request.include_downstream,
         )
-        states = storage.record_retry(
+        retry_states = storage.record_retry(
             request.dag_id,
             request.run_id,
             request.task_ids,
@@ -409,7 +418,7 @@ class ClearTasksAction:
             "task_instances": cleared,
             "retry_attempts": {
                 task: {"attempts": s.attempts, "auto_attempts": s.auto_attempts}
-                for task, s in states.items()
+                for task, s in retry_states.items()
             },
             "next_step": "Follow up with airflow_get_run_status until the task(s) succeed.",
         }
@@ -426,7 +435,7 @@ class ClearTasksAction:
         if not request.dry_run and not request.reason.strip():
             raise GuardrailError("A 'reason' is required when dry_run=false (it is journaled).")
 
-    def _classifications(self, request: ClearRequest) -> dict[str, str]:
+    def _classifications(self, request: ClearRequest, states: dict[str, str]) -> dict[str, str]:
         """Category per requested task: cached diagnosis, else classify the latest try now."""
         result: dict[str, str] = {}
         missing: list[str] = []
@@ -438,10 +447,15 @@ class ClearTasksAction:
                 missing.append(task_id)
         if not missing:
             return result
-        instances = {
-            str(ti["task_id"]): ti
-            for ti in self.client.list_task_instances(request.dag_id, request.run_id)
-        }
+        instances = (
+            {
+                str(ti["task_id"]): ti
+                for ti in self.client.list_task_instances(request.dag_id, request.run_id)
+            }
+            if missing
+            else {}
+        )
+        del states  # states only tell failed vs not; the full instance is needed to read logs
         for task_id in missing:
             ti = instances.get(task_id)
             if ti is None or ti.get("state") not in ("failed", "up_for_retry"):

@@ -173,7 +173,8 @@ flowchart TD
 
 Les règles qu'**aucun réglage ne peut désactiver** :
 
-- jamais le DAG entier ;
+- jamais une tâche déjà réussie, ni le DAG entier : seules la tâche en échec et les tâches
+  qu'elle a bloquées sont relancées ;
 - toujours un aperçu d'abord ;
 - jamais en dehors de l'allowlist ;
 - pas de relance d'une erreur grave sans confirmation explicite ;

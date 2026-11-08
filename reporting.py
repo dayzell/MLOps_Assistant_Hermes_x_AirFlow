@@ -178,6 +178,23 @@ class _DagData:
     def dag_id(self) -> str:
         return str(self.dag["dag_id"])
 
+    def masked_runs(self) -> list[dict[str, Any]]:
+        """Runs marked ``success`` that contain failed task instances.
+
+        Airflow derives a run's state from its LEAF tasks: a final task with
+        ``trigger_rule="all_done"`` (cleanup, notification) succeeds even when an upstream
+        task failed, so the whole run is reported ``success`` and the failure is masked.
+        """
+        masked = []
+        for run in self.runs:
+            if run.get("state") != "success":
+                continue
+            tis = self.tis_by_run.get(str(run["run_id"])) or []
+            failed = sorted(str(ti["task_id"]) for ti in tis if ti.get("state") == "failed")
+            if failed:
+                masked.append({**run, "failed_tasks": failed})
+        return masked
+
 
 class ReportBuilder:
     """Collect Airflow data for a scope/period and render the standard report."""
@@ -245,9 +262,9 @@ class ReportBuilder:
     def _collect(self, dag: dict[str, Any], start: datetime) -> _DagData:
         dag_id = str(dag["dag_id"])
         try:
-            runs = self.client.list_dag_runs(
-                dag_id, limit=MAX_RUNS_PER_DAG, start_date_gte=_iso(start)
-            )
+            # Newest first; the window is applied client-side on the logical date (a run
+            # cleared for a retry gets a new start_date, or none while queued).
+            runs = self.client.list_dag_runs(dag_id, limit=MAX_RUNS_PER_DAG)
             runs = [run for run in runs if self._in_window(run, start)]
             detailed = runs[:MAX_RUNS_DETAILED]
             tis_by_run = {
@@ -261,7 +278,7 @@ class ReportBuilder:
             return _DagData(dag, [], error=exc.to_dict())
 
     def _in_window(self, run: dict[str, Any], start: datetime) -> bool:
-        moment = parse_datetime(run.get("start_date")) or parse_datetime(run.get("logical_date"))
+        moment = parse_datetime(run.get("logical_date")) or parse_datetime(run.get("start_date"))
         return moment is not None and start <= moment <= self.now
 
     # ------------------------------------------------------------------ section 2
@@ -277,6 +294,8 @@ class ReportBuilder:
                 totals[state] += count
             durations = [r["duration_s"] for r in item.runs if r.get("duration_s") is not None]
             finished = counts["success"] + counts["failed"]
+            masked = len(item.masked_runs())
+            totals["masked"] += masked
             per_dag.append(
                 {
                     "dag_id": item.dag_id,
@@ -284,6 +303,7 @@ class ReportBuilder:
                     "runs": len(item.runs),
                     "success": counts["success"],
                     "failed": counts["failed"],
+                    "masked_failures": masked,
                     "other": len(item.runs) - finished,
                     "success_rate": _round(counts["success"] / finished, 4) if finished else None,
                     "last_run_state": item.runs[0].get("state") if item.runs else None,
@@ -295,11 +315,12 @@ class ReportBuilder:
         total_runs = sum(len(item.runs) for item in data)
         finished = totals["success"] + totals["failed"]
         rate = totals["success"] / finished if finished else None
+        incidents = totals["failed"] + totals["masked"]
         if total_runs == 0:
             status = "no_data"
-        elif totals["failed"] == 0:
+        elif incidents == 0:
             status = "healthy"
-        elif rate is not None and rate >= 0.9:
+        elif totals["failed"] == 0 or (rate is not None and rate >= 0.9):
             status = "degraded"
         else:
             status = "failing"
@@ -310,7 +331,8 @@ class ReportBuilder:
             "failed": totals["failed"],
             "other": total_runs - finished,
             "success_rate": _round(rate, 4),
-            "incidents": totals["failed"],
+            "masked_failures": totals["masked"],
+            "incidents": incidents,
             "per_dag": per_dag,
         }
 
@@ -531,6 +553,22 @@ class ReportBuilder:
                 if diagnoses:
                     entry["diagnosis"] = diagnoses
                 failed_runs.append(entry)
+        for item in data:
+            for run in item.masked_runs():
+                entry = {
+                    "dag_id": item.dag_id,
+                    "run_id": str(run["run_id"]),
+                    "start_date": run.get("start_date"),
+                    "end_date": run.get("end_date"),
+                    "failed_tasks": run["failed_tasks"],
+                    "masked": True,
+                }
+                diagnoses = self._cached_diagnoses(
+                    item.dag_id, entry["run_id"], run["failed_tasks"]
+                )
+                if diagnoses:
+                    entry["diagnosis"] = diagnoses
+                failed_runs.append(entry)
         failed_runs.sort(key=lambda r: str(r.get("start_date") or ""), reverse=True)
         try:
             actions = storage.list_audit_entries(
@@ -541,7 +579,8 @@ class ReportBuilder:
             logger.warning("airflow-mlops: cannot read the audit log", exc_info=True)
             actions, actions_error = [], "audit log unavailable"
         result: dict[str, Any] = {
-            "failed_run_count": len(failed_runs),
+            "failed_run_count": sum(1 for r in failed_runs if not r.get("masked")),
+            "masked_run_count": sum(1 for r in failed_runs if r.get("masked")),
             "failed_runs": failed_runs[:50],
             "actions": [
                 {
@@ -592,6 +631,20 @@ class ReportBuilder:
                         ),
                     }
                 )
+        masked = [d for d in report["health"]["per_dag"] if d.get("masked_failures")]
+        for dag in masked:
+            recs.append(
+                {
+                    "severity": "high",
+                    "dag_id": dag["dag_id"],
+                    "message": (
+                        f"{dag['masked_failures']} run(s) de {dag['dag_id']} marqué(s) « success » "
+                        "contiennent des tâches en échec, masquées par la trigger_rule d'une tâche "
+                        "finale (ex. all_done) : lancer airflow_diagnose_run et revoir les "
+                        "trigger_rule."
+                    ),
+                }
+            )
         for task in report["performance"]["tasks"]:
             change = task["change_vs_baseline"]
             if task["trend"] == "slower" and change is not None and change >= 0.25:
@@ -747,7 +800,8 @@ def render_markdown(report: dict[str, Any]) -> str:
         f"- Runs : {health['total_runs']} (succès {health['success']}, échecs {health['failed']}, "
         f"autres {health['other']})",
         f"- Taux de succès : {_fmt_rate(health['success_rate'])}",
-        f"- Incidents : {health['incidents']}",
+        f"- Incidents : {health['incidents']} (dont {health['masked_failures']} échec(s) masqué(s) "
+        "dans des runs « success »)",
     ]
     if health["per_dag"]:
         lines += [
@@ -825,6 +879,8 @@ def render_markdown(report: dict[str, Any]) -> str:
         "",
         f"- Runs en échec : {incidents['failed_run_count']}",
     ]
+    if incidents.get("masked_run_count"):
+        lines.append(f"- Runs « success » masquant des échecs : {incidents['masked_run_count']}")
     for run in incidents["failed_runs"][:20]:
         tasks = ", ".join(run["failed_tasks"]) if run["failed_tasks"] else "?"
         diagnosis = run.get("diagnosis")
@@ -833,11 +889,17 @@ def render_markdown(report: dict[str, Any]) -> str:
             if diagnosis
             else ""
         )
-        lines.append(f"  - {run['dag_id']} / {run['run_id']} : tâches {tasks}{diag}")
+        flag = " ⚠️ run marqué success (échec masqué)" if run.get("masked") else ""
+        lines.append(f"  - {run['dag_id']} / {run['run_id']} : tâches {tasks}{diag}{flag}")
     if incidents["actions"]:
         lines.append(f"- Actions prises : {len(incidents['actions'])}")
         for action in incidents["actions"][:20]:
-            mode = "dry-run" if action["dry_run"] else ("auto" if action["auto"] else "manuel")
+            if action["tool"] == "airflow_sandbox_test":
+                mode = "bac à sable"
+            elif action["dry_run"]:
+                mode = "aperçu"
+            else:
+                mode = "auto" if action["auto"] else "manuel"
             lines.append(
                 f"  - {action['ts']} {action['tool']} {action['dag_id']} "
                 f"{', '.join(action['task_ids'])} ({mode}) → {action['outcome']}"

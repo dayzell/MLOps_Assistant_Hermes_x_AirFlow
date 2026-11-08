@@ -450,6 +450,12 @@ class RunDiagnoser:
             if item["classification"] and item["classification"]["category"] == TRANSIENT
         ]
 
+        if run.get("state") == "success" and failed:
+            base["masked_failure"] = (
+                "The run is marked 'success' although tasks failed: a final task with a "
+                "permissive trigger_rule (e.g. all_done) masked the failure. Treat it as a "
+                "real incident and review the trigger_rule of the final tasks."
+            )
         base.update(
             status="failed" if failed else "retrying",
             summary={

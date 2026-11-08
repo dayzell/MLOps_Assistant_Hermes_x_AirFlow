@@ -143,13 +143,26 @@ def test_dry_run_is_the_default(api_version: str, airflow: respx.MockRouter) -> 
     route = mock_env(
         airflow,
         api_version,
-        {"transform": "failed", "load": "upstream_failed"},
+        {
+            "extract": "success",
+            "transform": "failed",
+            "load": "upstream_failed",
+            "quality_check": "upstream_failed",
+            "notify": "upstream_failed",
+        },
         logs={"transform": TRANSIENT_LOG},
     )
     result = ctx.call("airflow_clear_tasks", dag_id="train", run_id="run_1", task_ids=["transform"])
     assert result["ok"] is True, result
     assert result["dry_run"] is True and result["outcome"] == "dry_run"
-    assert [ti["task_id"] for ti in result["task_instances"]] == ["transform"]
+    # root + the tasks it blocked (include_downstream + only_failed), never "extract"
+    assert sorted(ti["task_id"] for ti in result["task_instances"]) == [
+        "load",
+        "notify",
+        "quality_check",
+        "transform",
+    ]
+    assert result["rerun_succeeded_tasks"] == []
     assert [b["dry_run"] for b in bodies(route)] == [True]  # nothing was changed
     assert result["classification"] == {"transform": "transient"}
     entry = storage.list_audit_entries(0)[0]
@@ -157,40 +170,72 @@ def test_dry_run_is_the_default(api_version: str, airflow: respx.MockRouter) -> 
 
 
 def test_whole_dag_is_refused(api_version: str, airflow: respx.MockRouter) -> None:
+    """Listing every task while also re-running the succeeded ones is refused up front."""
     ctx = writable(api_version)
-    route = mock_env(airflow, api_version, {t: "failed" for t in DOWNSTREAM})
+    route = mock_env(
+        airflow,
+        api_version,
+        {"extract": "success", **{t: "failed" for t in DOWNSTREAM if t != "extract"}},
+    )
     result = ctx.call(
         "airflow_clear_tasks",
         dag_id="train",
         run_id="run_1",
         task_ids=list(DOWNSTREAM),
+        only_failed=False,
         dry_run=False,
         reason="retry all",
         confirm_critical=True,
     )
     assert result["error"]["type"] == "guardrail"
-    assert "whole DAG" in result["error"]["message"] or "every task" in result["error"]["message"]
+    assert "whole DAG" in result["error"]["message"]
     assert route.call_count == 0
     assert storage.list_audit_entries(0)[0]["outcome"] == "refused"
+
+
+def test_first_task_failure_reruns_every_blocked_task(
+    api_version: str, airflow: respx.MockRouter
+) -> None:
+    """Real case: the first task failed, everything else is upstream_failed. Re-running all
+    tasks is then the minimum necessary (nothing succeeded), so it is allowed."""
+    ctx = writable(api_version)
+    transient_cache("extract")
+    states = {"extract": "failed", **{t: "upstream_failed" for t in DOWNSTREAM if t != "extract"}}
+    route = mock_env(airflow, api_version, states)
+    result = ctx.call(
+        "airflow_clear_tasks",
+        dag_id="train",
+        run_id="run_1",
+        task_ids=["extract"],
+        dry_run=False,
+        reason="transient blip",
+    )
+    assert result["ok"] is True and result["outcome"] == "cleared", result
+    assert result["count"] == len(DOWNSTREAM)
+    assert [b["dry_run"] for b in bodies(route)] == [True, False]
 
 
 def test_downstream_expansion_to_whole_dag_is_refused(
     api_version: str, airflow: respx.MockRouter
 ) -> None:
+    """only_failed=false + include_downstream from the first task would re-run tasks that
+    already succeeded across the whole DAG: refused after Airflow's own dry run."""
     ctx = writable(api_version)
     transient_cache("extract")
-    route = mock_env(airflow, api_version, {t: "failed" for t in DOWNSTREAM})
+    states = {"extract": "failed", **{t: "success" for t in DOWNSTREAM if t != "extract"}}
+    route = mock_env(airflow, api_version, states)
     result = ctx.call(
         "airflow_clear_tasks",
         dag_id="train",
         run_id="run_1",
         task_ids=["extract"],
         include_downstream=True,
-        only_failed=True,
+        only_failed=False,
         dry_run=False,
         reason="retry",
     )
     assert result["error"]["type"] == "guardrail"
+    assert "already succeeded" in result["error"]["message"]
     assert [b["dry_run"] for b in bodies(route)] == [True]  # previewed, never executed
 
 
@@ -302,7 +347,7 @@ def test_real_clear_is_targeted_counted_and_journaled(
         "only_failed": True,
         "only_running": False,
         "include_upstream": False,
-        "include_downstream": False,
+        "include_downstream": True,
         "include_future": False,
         "include_past": False,
         "reset_dag_runs": True,

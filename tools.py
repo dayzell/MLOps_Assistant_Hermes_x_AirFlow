@@ -395,7 +395,7 @@ class WriteTools:
             raise ToolInputError("'reason' must be a string.")
         flags: dict[str, bool] = {}
         for name, default in (
-            ("include_downstream", False),
+            ("include_downstream", True),
             ("only_failed", True),
             ("dry_run", True),
             ("confirm_critical", False),

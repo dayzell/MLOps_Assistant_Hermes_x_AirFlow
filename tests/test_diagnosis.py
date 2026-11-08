@@ -238,3 +238,18 @@ def test_run_not_found(api_version: str, airflow: respx.MockRouter, ctx: FakeCon
     airflow.get(RUN).respond(404, json={"detail": "DAGRun not found"})
     result = ctx.call("airflow_diagnose_run", dag_id="train", run_id="run_1")
     assert result["ok"] is False and result["error"]["type"] == "not_found"
+
+
+def test_masked_failure_is_flagged(
+    api_version: str, airflow: respx.MockRouter, ctx: FakeContext
+) -> None:
+    mock_run(
+        airflow,
+        api_version,
+        {"extract": "success", "transform": "failed", "notify": "success"},
+        logs={"transform": TRANSIENT_LOG},
+        run_state="success",
+    )
+    result = ctx.call("airflow_diagnose_run", dag_id="train", run_id="run_1")
+    assert result["status"] == "failed"
+    assert "trigger_rule" in result["masked_failure"]

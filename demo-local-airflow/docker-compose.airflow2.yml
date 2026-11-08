@@ -1,0 +1,25 @@
+# Optional, manual end-to-end test only: a throw-away single-container Airflow 2.9 (standalone
+# mode, SQLite). NOT for production. Not part of the plugin.
+#
+#   docker compose -f demo-local-airflow/docker-compose.airflow2.yml up -d
+#   -> REST API v1 on http://localhost:8080/api/v1, basic auth admin / admin
+#
+# Plugin settings for this demo: base_url http://localhost:8080, api_version v1,
+# auth_mode basic, secrets AIRFLOW_USERNAME=admin / AIRFLOW_PASSWORD=admin.
+services:
+  airflow:
+    image: apache/airflow:2.9.3
+    command: standalone
+    ports:
+      - "8080:8080"
+    environment:
+      # Handled by the image entrypoint before "standalone": DB migration + a known admin user.
+      _AIRFLOW_DB_MIGRATE: "true"
+      _AIRFLOW_WWW_USER_CREATE: "true"
+      _AIRFLOW_WWW_USER_USERNAME: admin
+      _AIRFLOW_WWW_USER_PASSWORD: admin
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      # Airflow 2 REST API: enable HTTP basic auth (the plugin's auth_mode "basic").
+      AIRFLOW__API__AUTH_BACKENDS: airflow.api.auth.backend.basic_auth,airflow.api.auth.backend.session
+    volumes:
+      - ./dags:/opt/airflow/dags:ro

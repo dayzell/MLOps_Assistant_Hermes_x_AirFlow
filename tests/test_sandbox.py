@@ -410,3 +410,63 @@ def test_runner_compare_structure() -> None:
         "added_edges": ["a>>c"],
         "removed_edges": ["a>>b"],
     }
+
+
+# --------------------------------------------------------------------------- real-run findings
+
+
+def test_task_killed_by_memory_limit_is_reported_as_oom() -> None:
+    out = sentinel(False, task={"passed": False, "exit_code": -9, "output": "Executing"})
+    result = parse_terminal_result(terminal(out, 1), Settings(sandbox_memory="512m"))
+    assert result["oom"] is True and "512m" in result["error"]
+
+
+def test_network_failure_gets_a_sandbox_hint() -> None:
+    out = sentinel(
+        False,
+        task={
+            "passed": False,
+            "exit_code": 1,
+            "output": "URLError: Temporary failure in name resolution",
+        },
+    )
+    result = parse_terminal_result(terminal(out, 1), Settings())
+    assert "never allows" in result["hint"] and result["oom"] is False
+
+
+def test_docker_command_disables_log_colours(tmp_path: Path) -> None:
+    command = build_docker_command(
+        Settings(sandbox_image="i"),
+        tmp_path,
+        level="import",
+        dag_id="d",
+        task_id=None,
+        container_name="c",
+    )
+    assert "AIRFLOW__LOGGING__COLORED_CONSOLE_LOG=False" in command
+
+
+def test_runner_strips_ansi() -> None:
+    spec = importlib.util.spec_from_file_location(
+        "check_dag_ansi", ROOT / "sandbox_runner" / "check_dag.py"
+    )
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    assert module._clean("\x1b[34mINFO\x1b[0m - Done") == "INFO - Done"
+
+
+def test_stale_workspaces_are_purged(tmp_path: Path) -> None:
+    import os
+    import time
+
+    from airflow_mlops.sandbox import purge_stale_workspaces
+
+    old, fresh = tmp_path / "old", tmp_path / "fresh"
+    for folder in (old, fresh):
+        (folder / "dags").mkdir(parents=True)
+    two_hours_ago = time.time() - 7200
+    os.utime(old, (two_hours_ago, two_hours_ago))
+    assert purge_stale_workspaces(tmp_path) == 1
+    assert not old.exists() and fresh.exists()
+    assert purge_stale_workspaces(tmp_path / "missing") == 0

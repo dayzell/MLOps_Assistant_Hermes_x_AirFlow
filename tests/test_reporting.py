@@ -391,3 +391,30 @@ def test_slash_command_returns_markdown(
 def test_slash_command_reports_errors_as_text(ctx: FakeContext) -> None:
     text = ctx.commands["airflow-report"]["handler"]("all 99y")
     assert text.startswith("❌ /airflow-report")
+
+
+def test_masked_failures_in_success_runs(
+    api_version: str, airflow: respx.MockRouter, ctx: FakeContext
+) -> None:
+    """Found on a real Airflow: an all_done final task makes a failed run look successful."""
+    airflow.get("/dags/train/details").respond(json=p.dag_details(api_version, "train"))
+    airflow.get("/dags/train/dagRuns").respond(
+        json=collection("dag_runs", [run("m1", "success", 1)])
+    )
+    airflow.get("/dags/train/dagRuns/m1/taskInstances").respond(
+        json=collection(
+            "task_instances", [ti("train", "failed", 2.0), ti("notify", "success", 1.0)]
+        )
+    )
+    airflow.get(path__regex=r".*/xcomEntries$").respond(json=collection("xcom_entries", []))
+    result = ctx.call("airflow_build_report", scope="train", period="24h")
+    report = result["report"]
+    assert report["health"]["masked_failures"] == 1
+    assert report["health"]["incidents"] == 1
+    assert report["health"]["status"] == "degraded"
+    masked = report["incidents"]["failed_runs"][0]
+    assert masked["masked"] is True and masked["failed_tasks"] == ["train"]
+    assert report["incidents"]["masked_run_count"] == 1
+    assert report["recommendations"][0]["severity"] == "high"
+    assert "trigger_rule" in report["recommendations"][0]["message"]
+    assert "échec masqué" in result["markdown"]

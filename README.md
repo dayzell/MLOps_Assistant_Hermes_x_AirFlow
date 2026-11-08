@@ -79,6 +79,119 @@ plugins:
         dag_allowlist: ["ml_*", "etl_daily"]
 ```
 
+## Mode opératoire : Hermes avec un modèle local (Ollama)
+
+Cette procédure fait tourner l'agent avec un modèle **gratuit, en local**, sans clé d'API.
+Elle a été validée le 08/11/2026 sous Windows 11 avec Hermes Desktop 0.23, Ollama 0.23,
+`hermes3:8b` et une RTX 2060 (6 Go).
+
+### 1. Installer le modèle
+
+```powershell
+ollama pull hermes3:8b            # ~4,7 Go
+ollama show hermes3:8b            # "tools" doit figurer dans les capacités
+ollama list                       # liste des modèles installés
+```
+
+### 2. Pointer Hermes vers Ollama
+
+La configuration de Hermes se trouve avec `hermes config path`. Sous Windows, avec Hermes
+Desktop : `%LOCALAPPDATA%\hermes\config.yaml`, dans un dossier caché (`Windows + R` → coller ce
+chemin).
+
+```powershell
+Copy-Item "$env:LOCALAPPDATA\hermes\config.yaml" "$env:LOCALAPPDATA\hermes\config.yaml.bak"
+```
+
+Ajoutez, ou modifiez s'il existe déjà, le bloc `model:` :
+
+```yaml
+model:
+  provider: custom                     # Ollama (API compatible OpenAI) ; "ollama" est un alias
+  base_url: http://localhost:11434/v1
+  default: hermes3:8b
+  ollama_num_ctx: 65536                # Hermes exige >= 64 000 tokens pour utiliser les outils
+```
+
+> Avec un contexte plus petit, Hermes refuse de répondre : « Hermes needs at least 64,000
+> tokens for reliable tool use ».
+
+### 3. Régler Ollama (une seule fois)
+
+Hermes fait aussi des **appels secondaires** au même modèle, par exemple pour générer le titre
+de la conversation, sans préciser de contexte. Sans réglage, Ollama recharge alors le modèle en
+4096 tokens, puis de nouveau en 65 536. Résultat : des rechargements à chaque tour et des
+erreurs `Title generation failed: Request timed out`.
+
+On fixe donc le contexte côté Ollama, et on compresse sa mémoire :
+
+```powershell
+[Environment]::SetEnvironmentVariable("OLLAMA_CONTEXT_LENGTH", "65536", "User")  # même contexte pour tous les appels
+[Environment]::SetEnvironmentVariable("OLLAMA_FLASH_ATTENTION", "1", "User")     # requis pour compresser le contexte
+[Environment]::SetEnvironmentVariable("OLLAMA_KV_CACHE_TYPE", "q8_0", "User")    # mémoire du contexte divisée par 2
+```
+
+Puis **redémarrez Ollama** : quittez-le depuis l'icône de la barre des tâches, puis relancez-le.
+Sur macOS, l'équivalent est `launchctl setenv OLLAMA_CONTEXT_LENGTH 65536`, et de même pour les
+deux autres variables, avant de relancer l'application.
+
+### 4. Vérifier
+
+```powershell
+hermes status                                      # Model: hermes3:8b, Provider: custom
+hermes -z "Réponds uniquement par le mot : OK"     # un seul message, affiche la réponse
+ollama ps                                          # CONTEXT doit afficher 65536
+```
+
+### 5. Brancher le plugin
+
+```powershell
+# Lien vers le dossier du projet : les modifications du code sont prises en compte sans réinstaller
+New-Item -ItemType Directory -Force "$env:LOCALAPPDATA\hermes\plugins"
+New-Item -ItemType Junction -Path "$env:LOCALAPPDATA\hermes\plugins\airflow-mlops" `
+         -Target "C:\chemin\vers\pluging_hermes_x_airflow"
+hermes plugins enable airflow-mlops
+hermes plugins list
+```
+
+Si le plugin n'apparaît pas, `$env:HERMES_PLUGINS_DEBUG=1; hermes plugins list` affiche le
+détail. Autre solution : l'installer depuis GitHub, avec
+`hermes plugins install <url-du-dépôt> --enable`.
+
+Ajoutez ensuite les réglages du plugin dans `config.yaml`, sous `plugins.entries.airflow-mlops.settings`
+(voir « Configuration » plus haut et la démo Airflow 2.9 : `api_version: v1`, `auth_mode: basic`).
+Placez les identifiants dans **`%LOCALAPPDATA%\hermes\.env`**, et non dans le dossier du projet :
+
+```powershell
+Set-Content -Path "$env:LOCALAPPDATA\hermes\.env" -Encoding utf8 `
+            -Value "AIRFLOW_USERNAME=admin`nAIRFLOW_PASSWORD=admin"
+hermes plugins doctor airflow-mlops
+```
+
+### Performances constatées et limites
+
+| Machine | Empreinte (modèle + 64k de contexte) | Répartition | 1er appel (chargement) | Appel simple ensuite |
+|---|---|---|---|---|
+| PC, RTX 2060 6 Go, 30 Go de RAM | ~13 Go | 65 % CPU / 35 % GPU | ~40 s | ~1 à 1,5 min |
+
+- Les 64 000 tokens exigés par Hermes ne tiennent pas dans 6 Go de mémoire graphique : une
+  grande partie tourne sur le processeur. **C'est fonctionnel mais lent.** Une tâche avec
+  plusieurs appels d'outils prend plusieurs minutes.
+- Un modèle de 8B se trompe parfois : il a répondu « 11 » à « 3+4 » lors d'un test. Il faut le
+  guider en nommant l'outil à utiliser (« utilise airflow_list_dags »).
+- Un Mac Apple Silicon avec 16 Go de mémoire unifiée, ou un modèle hébergé, donne une
+  expérience nettement plus fluide.
+
+### Dépannage
+
+| Symptôme | Cause | Solution |
+|---|---|---|
+| « Hermes needs at least 64,000 tokens » | `ollama_num_ctx` trop petit | `ollama_num_ctx: 65536` (étape 2) |
+| `Title generation failed: Request timed out` dans `logs/agent.log` | rechargements du modèle | `OLLAMA_CONTEXT_LENGTH=65536`, puis redémarrer Ollama (étape 3) |
+| `ollama ps` affiche `CONTEXT 4096` | variables non prises en compte | redémarrer **complètement** Ollama, y compris l'icône de la barre des tâches |
+| `ollama: command not found` dans Git Bash (VS Code) | PATH réécrit par l'extension Python | utiliser PowerShell, ou relancer la fenêtre VS Code |
+| Revenir en arrière | — | restaurer `config.yaml.bak` et supprimer les 3 variables `OLLAMA_*` |
+
 ## Outils (toolset `airflow`)
 
 Tous les outils renvoient une chaîne JSON : `{"ok": true, ...}` ou
@@ -209,7 +322,7 @@ Elles sont enregistrées via `ctx.register_skill` et accessibles sous le nom
 
 ## Remédiation protégée (`airflow_clear_tasks`)
 
-`airflow_clear_tasks(dag_id, run_id, task_ids, include_downstream=false, only_failed=true,
+`airflow_clear_tasks(dag_id, run_id, task_ids, include_downstream=true, only_failed=true,
 dry_run=true, reason, confirm_critical=false)` relance **uniquement** les task instances
 nécessaires d'**un** run. L'outil n'est exposé que si `read_only: false`.
 
@@ -220,7 +333,8 @@ Aucun réglage ne permet de les désactiver.
 | Règle | Comportement |
 |---|---|
 | `task_ids` vide | refusé ; il n'existe pas de « clear » de DAG entier |
-| DAG entier | refusé si les tâches demandées, ou le résultat après `include_downstream`, couvrent toutes les tâches du DAG (DAG de 2 tâches ou plus) |
+| Tâches déjà réussies | jamais relancées par défaut : `only_failed=true` (avec `include_downstream=true`) relance la racine et les tâches qu'elle a bloquées (`upstream_failed`), et rien d'autre |
+| DAG entier | refusé dès que la relance couvrirait toutes les tâches du DAG **en ré-exécutant des tâches déjà réussies** (DAG de 2 tâches ou plus) |
 | Portée | un seul run (`dag_run_id`) ; jamais d'amont, de passé, de futur ni de plage de dates ; 20 tâches au maximum |
 | `dry_run=true` par défaut | renvoie la liste exacte calculée par le *dry run* d'Airflow, sans rien modifier |
 | Erreur `critical` | relance réelle refusée sans `confirm_critical=true` ; le dry run reste possible, avec un avertissement |
@@ -373,16 +487,113 @@ hermes plugins doctor . --ci
 hermes plugins validate . --install-deps
 ```
 
-Les tests mockent l'API Airflow avec `respx`, en v1 et en v2. Ils remplacent les modules hôtes
-Hermes par des doublures, uniquement dans `tests/harness.py`.
+## Tests
+
+Le projet a trois niveaux de vérification, du plus rapide au plus réaliste :
+
+| Niveau | Commande | Durée | Ce qui est réel |
+|---|---|---|---|
+| 1. Tests unitaires | `pytest` | ~10 s | la logique du plugin ; Airflow et Docker sont simulés |
+| 2. Validation Hermes | `hermes plugins doctor . --ci` et `hermes plugins validate .` | ~30 s | le chargement par le vrai Hermes |
+| 3. Test Docker du bac à sable | `python demo-local-airflow/sandbox_smoke_test.py` | ~2–3 min | de vrais conteneurs Airflow |
+| 4. Test de bout en bout | `python demo-local-airflow/e2e_walkthrough.py` | ~1 min | un vrai serveur Airflow et ses vraies réponses |
+
+### 1. Tests unitaires (`pytest`, 297 tests)
+
+Ils simulent l'API Airflow avec `respx`, au format exact des versions **v1** (Airflow 2.x) et
+**v2** (Airflow 3.x). La plupart des tests tournent sur les deux versions. Les modules hôtes de
+Hermes (`plugin_storage`, `plugin_utils`, `secret_scope`) sont remplacés par des doublures,
+uniquement dans [tests/harness.py](tests/harness.py) : aucun Hermes, aucun Airflow ni aucun
+Docker n'est nécessaire.
+
+| Fichier | Tests | Ce qui est vérifié |
+|---|---|---|
+| [test_tools.py](tests/test_tools.py) | 38 | Un test par outil de lecture, allowlist, pagination, encodage des `run_id`, erreurs HTTP en JSON clair, aucun traceback exposé |
+| [test_client.py](tests/test_client.py) | 18 | Authentification basic / token / JWT (et son renouvellement), relances réseau, codes HTTP, lecture des logs v1 et v2, réglages |
+| [test_redaction.py](tests/test_redaction.py) | 32 | Masquage de chaque forme de secret, et le texte normal laissé intact |
+| [test_classification.py](tests/test_classification.py) | 33 | 22 erreurs réelles classées `transient` / `critical`, priorité du critique, OOM récurrent, règles personnalisées |
+| [test_diagnosis.py](tests/test_diagnosis.py) | 20 | Diagnostic de bout en bout : racine, échecs secondaires, tâches impactées, échecs masqués, XComs, cache |
+| [test_reporting.py](tests/test_reporting.py) | 51 | **Forme du rapport** (6 sections, toujours dans le même ordre), échecs masqués, calculs, ligne de base, SLA, qualité des données, commande `/airflow-report` |
+| [test_guardrails.py](tests/test_guardrails.py) | 47 | **Garde-fous** : aucune tâche réussie relancée, refus du DAG entier, `dry_run` par défaut, refus du critique, limite et backoff des relances automatiques, hook d'approbation, journal obligatoire |
+| [test_sandbox.py](tests/test_sandbox.py) | 35 | Application des diffs, chemins interdits, commande Docker bridée, lecture des résultats (OOM, timeout, réseau), budget, nettoyage |
+| [test_storage.py](tests/test_storage.py) | 3 | Base SQLite : migrations et cache des diagnostics |
+| [test_skills.py](tests/test_skills.py) | 7 | Format des 3 skills, et outils cités qui existent bien |
+| [test_register.py](tests/test_register.py) | 7 | Manifest identique à ce que `register()` enregistre, aucun appel réseau au chargement, aucune lecture de `.env` |
+| [test_textutils.py](tests/test_textutils.py) | 6 | Extraction du bloc d'erreur et troncature |
+
+```bash
+.venv/Scripts/python -m pytest        # résumé
+.venv/Scripts/python -m pytest -v     # une ligne par test
+```
+
+### 2. Validation Hermes
+
+- `hermes plugins doctor . --ci` charge le plugin avec le vrai Hermes, dans un environnement
+  temporaire. Il vérifie les noms des hooks, les `**kwargs` et les enregistrements.
+- `hermes plugins validate .` exécute les contrôles d'admission au catalogue : outils et hooks
+  déclarés = enregistrés, analyse de sécurité, absence de monkey-patching, dépendances.
+
+### 3. Test Docker du bac à sable (manuel)
+
+[demo-local-airflow/sandbox_smoke_test.py](demo-local-airflow/sandbox_smoke_test.py) fait
+passer **le vrai code du bac à sable** par 6 scénarios sur de vrais conteneurs. Seul l'outil
+`terminal` de Hermes est remplacé par un appel direct à bash. Le script nécessite Docker et une
+image Airflow locale ; il ne fait pas partie de `pytest`.
+
+```bash
+.venv/Scripts/python demo-local-airflow/sandbox_smoke_test.py                      # apache/airflow:2.9.3
+.venv/Scripts/python demo-local-airflow/sandbox_smoke_test.py --image apache/airflow:3.1.0
+```
+
+Résultat du 08/11/2026 avec `apache/airflow:2.9.3` :
+
+| Scénario | Attendu | Obtenu |
+|---|---|---|
+| A. Correctif d'un `KeyError`, niveau `import` | le DAG corrigé se charge | ✅ (11 s) |
+| B. Même correctif, niveau `structure` | même structure qu'en production | ✅ 3 tâches, aucun changement (11 s) |
+| C. Correctif cassé | erreur détectée | ✅ `SyntaxError: '(' was never closed` (9 s) |
+| D. Lancement réel d'une tâche | la tâche réussit | ✅ elle renvoie `{'rows': 1200}` (33 s) |
+| E. Tâche de 3 Go avec une limite de 512 Mo | tuée, `oom: true` | ✅ (32 s) |
+| F. Tâche qui appelle Internet | bloquée, explication donnée à l'agent | ✅ (47 s) |
+
+Le fichier DAG d'origine n'est pas modifié, et aucune copie temporaire ne reste après le test.
+
+### 4. Test de bout en bout sur un vrai Airflow (manuel)
+
+[demo-local-airflow/e2e_walkthrough.py](demo-local-airflow/e2e_walkthrough.py) appelle les
+outils du plugin, exactement comme Hermes, sur un vrai serveur Airflow. Il suit le déroulé des
+skills : lister, diagnostiquer, lire les logs et XComs, tester un correctif en bac à sable,
+relancer (aperçu puis relance), produire le rapport. Seul le LLM est absent : l'ordre des appels
+est fixé dans le script.
+
+```bash
+docker compose -f demo-local-airflow/docker-compose.airflow2.yml up -d   # Airflow 2.9.3, API v1
+# activer et déclencher les 3 DAGs de démo (UI http://localhost:8080, admin / admin)
+.venv/Scripts/python demo-local-airflow/e2e_walkthrough.py
+```
+
+Ce test, lancé le 08/11/2026 sur Airflow 2.9.3, a révélé **deux comportements réels
+d'Airflow** que les tests simulés ne pouvaient pas montrer. Les deux sont corrigés et couverts
+par des tests :
+
+| Constat sur le vrai Airflow | Correction |
+|---|---|
+| Une tâche finale `trigger_rule="all_done"` fait passer le run en **`success` malgré une tâche en échec** : l'échec est masqué | le rapport compte et liste les **échecs masqués**, recommande de revoir les `trigger_rule` ; `airflow_diagnose_run` signale `masked_failure` ; la skill de triage ne se fie plus au seul état du run |
+| Relancer seulement la tâche racine laisse les tâches en aval en **`upstream_failed`** : Airflow ne les relance pas tout seul et le run reste `failed` | `include_downstream=true` par défaut, avec `only_failed=true`. Cela relance la racine et les tâches qu'elle a bloquées, **jamais une tâche réussie** (vérifié sur le vrai Airflow) |
+
+Après correction, le run bloqué a été entièrement réparé : seule `publish` a été relancée, et
+le run est passé à `success`.
 
 ### Démo locale (optionnelle, hors plugin)
 
 Le dossier [demo-local-airflow/](demo-local-airflow/) contient un Airflow jetable. Il sert uniquement à essayer le plugin à la main et ne fait pas partie du plugin.
 
 ```bash
-docker compose -f demo-local-airflow/docker-compose.yml up     # Airflow 3 standalone, admin / admin
+docker compose -f demo-local-airflow/docker-compose.yml up             # Airflow 3, API v2, JWT
+docker compose -f demo-local-airflow/docker-compose.airflow2.yml up -d # Airflow 2.9, API v1, basic
 ```
+
+Pour Airflow 2.9 : `api_version: v1` et `auth_mode: basic`.
 
 Configurez ensuite `base_url: http://localhost:8080`, `api_version: v2`, `auth_mode: jwt` et
 les secrets `AIRFLOW_USERNAME=admin` / `AIRFLOW_PASSWORD=admin`, puis lancez `hermes chat`. Les

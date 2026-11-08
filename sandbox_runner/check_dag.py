@@ -17,15 +17,22 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 import time
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 SENTINEL = "SANDBOX_RESULT "
 MAX_OUTPUT_CHARS = 6000
+_ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+
+
+def _clean(text: str) -> str:
+    """Last part of a command output, without terminal colour codes."""
+    return _ANSI.sub("", text)[-MAX_OUTPUT_CHARS:]
 
 
 def compare_structure(
@@ -80,10 +87,10 @@ def _run_task(dag_id: str, task_id: str, budget_s: float) -> dict[str, Any]:
         return {
             "passed": False,
             "error": "airflow db migrate failed in the sandbox",
-            "output": (migrate.stdout + migrate.stderr)[-MAX_OUTPUT_CHARS:],
+            "output": _clean(migrate.stdout + migrate.stderr),
         }
     remaining = max(10.0, budget_s - (time.monotonic() - started))
-    logical_date = datetime.now(UTC).strftime("%Y-%m-%d")
+    logical_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")  # noqa: UP017 (Python < 3.11 images)
     try:
         proc = subprocess.run(
             ["airflow", "tasks", "test", dag_id, task_id, logical_date],
@@ -99,7 +106,7 @@ def _run_task(dag_id: str, task_id: str, budget_s: float) -> dict[str, Any]:
         "passed": proc.returncode == 0,
         "exit_code": proc.returncode,
         "duration_s": round(time.monotonic() - started, 1),
-        "output": (proc.stdout + proc.stderr)[-MAX_OUTPUT_CHARS:],
+        "output": _clean(proc.stdout + proc.stderr),
     }
 
 

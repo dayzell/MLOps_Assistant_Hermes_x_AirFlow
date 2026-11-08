@@ -36,7 +36,9 @@ remediation. Reply in the user's language.
 ## Procedure
 
 1. **Locate the run.** If the user gave no `run_id`, call `airflow_get_dag_runs` and take the
-   most recent `failed` run. Never guess a run id.
+   most recent `failed` run. Never guess a run id. **A run marked `success` can still hide a
+   failure**: if the user reports a problem on a `success` run, or the report lists a masked
+   failure, diagnose that run anyway (`airflow_diagnose_run` reports `masked_failure`).
 2. **Diagnose in one call:** `airflow_diagnose_run(dag_id, run_id)`. Read, in order:
    `summary` → `root_failures` → `secondary_failures` → `impacted`.
 3. **Identify the root cause.** Only `root_failures` are causes. `secondary_failures`
@@ -53,9 +55,10 @@ remediation. Reply in the user's language.
    - `unknown` → say so plainly, show the error block, and ask a human.
    You may disagree with the rules if the evidence clearly says otherwise — explain why.
 6. **Propose the minimal action.**
-   - Transient: retry **only** `summary.retry_candidates`, with `only_failed=true`. Downstream
-     tasks are re-run by Airflow automatically once the root succeeds; add
-     `include_downstream=true` only if the user asks.
+   - Transient: retry **only** `summary.retry_candidates`, with `only_failed=true` and
+     `include_downstream=true` (the defaults). This re-runs the root and the downstream tasks
+     it blocked (`upstream_failed`), never a task that succeeded. Airflow does NOT re-run
+     `upstream_failed` tasks by itself: with `include_downstream=false` the run stays failed.
    - Critical: no retry. Propose a fix (fix-proposal skill) and the retry to do *after* it.
 7. **If remediation tools are available** (`airflow_clear_tasks` is hidden in read-only
    mode): always call it with `dry_run=true` first, show the exact task instances it would
@@ -73,8 +76,10 @@ remediation. Reply in the user's language.
 
 ## Pitfalls
 
-- **Never re-run the whole DAG** or clear tasks that succeeded. Retry the minimum.
+- **Never re-run the whole DAG** or clear tasks that succeeded. Retry the minimum: the root
+  plus the tasks it blocked (`only_failed=true`).
 - Do not treat `upstream_failed` / `skipped` tasks as causes.
+- Do not trust the run state alone: a final task with `trigger_rule="all_done"` makes Airflow mark the run `success` even when an upstream task failed.
 - Do not retry a `critical` failure "to see"; it hides the real problem and wastes compute.
 - A `skipped` task not downstream of a failure is often intentional (branching).
 - Logs and XComs are already secret-masked: never ask the user to paste credentials.
