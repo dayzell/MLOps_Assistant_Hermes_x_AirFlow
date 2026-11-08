@@ -3,7 +3,7 @@
 Plugin **Hermes Agent** autonome qui transforme l'agent en assistant MLOps pour **Apache Airflow** :
 surveillance des DAGs, diagnostic de pannes, relance ciblée et protégée, rapports de monitoring normés.
 
-> **État : v0.6.0 — phases 1 à 5 livrées**
+> **État : v0.6.1 — phases 1 à 5 livrées, validé sur Airflow 2.9.3 et 3.4.0**
 > - Fait : outils en lecture seule, redaction, diagnostic de panne avec classification
 >   transient / critical, rapports normés, commande `/airflow-report`, 3 skills, et
 >   remédiation protégée (relance ciblée, approbation humaine, politique de relance
@@ -558,7 +558,7 @@ Le projet a trois niveaux de vérification, du plus rapide au plus réaliste :
 | 3. Test Docker du bac à sable | `python demo-local-airflow/sandbox_smoke_test.py` | ~2–3 min | de vrais conteneurs Airflow |
 | 4. Test de bout en bout | `python demo-local-airflow/e2e_walkthrough.py` | ~1 min | un vrai serveur Airflow et ses vraies réponses |
 
-### 1. Tests unitaires (`pytest`, 320 tests)
+### 1. Tests unitaires (`pytest`, 330 tests)
 
 Ils simulent l'API Airflow avec `respx`, au format exact des versions **v1** (Airflow 2.x) et
 **v2** (Airflow 3.x). La plupart des tests tournent sur les deux versions. Les modules hôtes de
@@ -573,10 +573,10 @@ Docker n'est nécessaire.
 | [test_redaction.py](tests/test_redaction.py) | 32 | Masquage de chaque forme de secret, et le texte normal laissé intact |
 | [test_classification.py](tests/test_classification.py) | 33 | 22 erreurs réelles classées `transient` / `critical`, priorité du critique, OOM récurrent, règles personnalisées |
 | [test_diagnosis.py](tests/test_diagnosis.py) | 20 | Diagnostic de bout en bout : racine, échecs secondaires, tâches impactées, échecs masqués, XComs, cache |
-| [test_reporting.py](tests/test_reporting.py) | 55 | **Forme du rapport** (6 sections, toujours dans le même ordre), échecs masqués, calculs, ligne de base, SLA, qualité des données, commande `/airflow-report` |
+| [test_reporting.py](tests/test_reporting.py) | 56 | **Forme du rapport** (6 sections, toujours dans le même ordre), échecs masqués, calculs, ligne de base, SLA, qualité des données, commande `/airflow-report` |
 | [test_guardrails.py](tests/test_guardrails.py) | 47 | **Garde-fous** : aucune tâche réussie relancée, refus du DAG entier, `dry_run` par défaut, refus du critique, limite et backoff des relances automatiques, hook d'approbation, journal obligatoire |
 | [test_dag_source.py](tests/test_dag_source.py) | 18 | Lecture du code d'un DAG : API v1/v2, dossier local prioritaire, écart avec le code déployé, plages de lignes, masquage, et un diff construit à partir du code lu qui s'applique bien |
-| [test_sandbox.py](tests/test_sandbox.py) | 36 | Application des diffs, chemins interdits, commande Docker bridée, lecture des résultats (OOM, timeout, réseau), budget, nettoyage |
+| [test_sandbox.py](tests/test_sandbox.py) | 45 | Application des diffs, chemins interdits, commande Docker bridée, lecture des résultats (OOM, timeout, réseau), budget, nettoyage |
 | [test_storage.py](tests/test_storage.py) | 3 | Base SQLite : migrations et cache des diagnostics |
 | [test_skills.py](tests/test_skills.py) | 7 | Format des 3 skills, et outils cités qui existent bien |
 | [test_register.py](tests/test_register.py) | 7 | Manifest identique à ce que `register()` enregistre, aucun appel réseau au chargement, aucune lecture de `.env` |
@@ -603,10 +603,11 @@ image Airflow locale ; il ne fait pas partie de `pytest`.
 
 ```bash
 .venv/Scripts/python demo-local-airflow/sandbox_smoke_test.py                      # apache/airflow:2.9.3
-.venv/Scripts/python demo-local-airflow/sandbox_smoke_test.py --image apache/airflow:3.1.0
+.venv/Scripts/python demo-local-airflow/sandbox_smoke_test.py --image apache/airflow:3.4.0
 ```
 
-Résultat du 08/11/2026 avec `apache/airflow:2.9.3` :
+Résultat du 08/11/2026, identique avec `apache/airflow:2.9.3` et `apache/airflow:3.4.0` (durées
+indiquées pour la 2.9.3 ; la 3.4.0 met ~10 s de plus aux scénarios D à F) :
 
 | Scénario | Attendu | Obtenu |
 |---|---|---|
@@ -628,10 +629,18 @@ relancer (aperçu puis relance), produire le rapport. Seul le LLM est absent : l
 est fixé dans le script.
 
 ```bash
-docker compose -f demo-local-airflow/docker-compose.airflow2.yml up -d   # Airflow 2.9.3, API v1
-# activer et déclencher les 3 DAGs de démo (UI http://localhost:8080, admin / admin)
+# Airflow 2.9.3, API v1, auth basic (http://localhost:8080)
+docker compose -f demo-local-airflow/docker-compose.airflow2.yml up -d
 .venv/Scripts/python demo-local-airflow/e2e_walkthrough.py
+
+# Airflow 3.4.0, API v2, auth JWT (http://localhost:8081) : tourne à côté de la 2.9
+docker compose -f demo-local-airflow/docker-compose.yml up -d
+.venv/Scripts/python demo-local-airflow/e2e_walkthrough.py --base-url http://localhost:8081 \
+    --api-version v2 --auth jwt --image apache/airflow:3.4.0
 ```
+
+Avant de lancer le script, activez et déclenchez les 3 DAGs de démo, dans l'interface web
+(`admin` / `admin`) ou via l'API.
 
 Ce test, lancé le 08/11/2026 sur Airflow 2.9.3, a révélé **deux comportements réels
 d'Airflow** que les tests simulés ne pouvaient pas montrer. Les deux sont corrigés et couverts
@@ -645,19 +654,35 @@ par des tests :
 Après correction, le run bloqué a été entièrement réparé : seule `publish` a été relancée, et
 le run est passé à `success`.
 
+Le même test, relancé le 08/11/2026 sur **Airflow 3.4.0** (la dernière version publiée), a
+validé l'API v2, l'authentification JWT, les logs structurés et les XComs natifs. Il a aussi
+révélé **quatre différences d'Airflow 3**, toutes corrigées et couvertes par des tests :
+
+| Constat sur Airflow 3.4 | Correction |
+|---|---|
+| Le serveur d'API ouvre le fichier des mots de passe **en écriture** : un montage en lecture seule le fait planter | `docker-compose.yml` monte `passwords.json` en lecture-écriture |
+| `DagBag` n'accepte plus l'argument `include_examples` : le script du bac à sable plantait | il n'utilise cet argument que si la version d'Airflow le connaît. En cas de plantage, il renvoie désormais **l'erreur réelle** au lieu de « no result line » |
+| **`airflow tasks test` sort avec le code 0 même quand la tâche échoue** : le bac à sable aurait déclaré « réussi » un correctif dont la tâche échoue | le résultat se base sur l'**état final annoncé** par Airflow (`new_state=…` en 3.x, `Marking task as …` en 2.x), puis seulement sur le code de sortie |
+| Un run manuel n'a **pas de `logical_date`**, et sa `start_date` change à chaque relance : le rapport l'écartait de la période | le rapport se base sur `logical_date`, puis sur **`run_after`**, qui est stable, puis sur `start_date` |
+
 ### Démo locale (optionnelle, hors plugin)
 
 Le dossier [demo-local-airflow/](demo-local-airflow/) contient un Airflow jetable. Il sert uniquement à essayer le plugin à la main et ne fait pas partie du plugin.
 
 ```bash
-docker compose -f demo-local-airflow/docker-compose.yml up             # Airflow 3, API v2, JWT
-docker compose -f demo-local-airflow/docker-compose.airflow2.yml up -d # Airflow 2.9, API v1, basic
+docker compose -f demo-local-airflow/docker-compose.yml up -d          # Airflow 3.4.0, port 8081
+docker compose -f demo-local-airflow/docker-compose.airflow2.yml up -d # Airflow 2.9.3, port 8080
 ```
 
-Pour Airflow 2.9 : `api_version: v1` et `auth_mode: basic`.
+Les deux tournent côte à côte : chaque fichier compose a son propre nom de projet et son propre
+port. Réglages du plugin :
 
-Configurez ensuite `base_url: http://localhost:8080`, `api_version: v2`, `auth_mode: jwt` et
-les secrets `AIRFLOW_USERNAME=admin` / `AIRFLOW_PASSWORD=admin`, puis lancez `hermes chat`. Les
+| Démo | `base_url` | `api_version` | `auth_mode` |
+|---|---|---|---|
+| Airflow 3.4.0 | `http://localhost:8081` | `v2` | `jwt` |
+| Airflow 2.9.3 | `http://localhost:8080` | `v1` | `basic` |
+
+Secrets : `AIRFLOW_USERNAME=admin` / `AIRFLOW_PASSWORD=admin`. Lancez ensuite `hermes chat`. Les
 DAGs de démonstration couvrent un cas sain, une erreur critique (`KeyError`) et une erreur
 transitoire (`ConnectionResetError`).
 

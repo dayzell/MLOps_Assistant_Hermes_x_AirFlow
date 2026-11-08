@@ -15,6 +15,7 @@ The result is printed on one line prefixed with ``SANDBOX_RESULT `` (JSON).
 from __future__ import annotations
 
 import argparse
+import inspect
 import json
 import os
 import re
@@ -60,7 +61,11 @@ def _load_dagbag(dags_folder: str) -> Any:
         from airflow.dag_processing.dagbag import DagBag  # type: ignore[import-not-found]
     except ImportError:  # Airflow 2.x / 3.0
         from airflow.models.dagbag import DagBag  # type: ignore[import-not-found]
-    return DagBag(dag_folder=dags_folder, include_examples=False)
+    # Airflow 3.4 removed the ``include_examples`` argument (examples are still disabled by
+    # AIRFLOW__CORE__LOAD_EXAMPLES=False in the container environment).
+    if "include_examples" in inspect.signature(DagBag.__init__).parameters:
+        return DagBag(dag_folder=dags_folder, include_examples=False)
+    return DagBag(dag_folder=dags_folder)
 
 
 def _graph(dag: Any) -> tuple[dict[str, list[str]], dict[str, str]]:
@@ -102,12 +107,38 @@ def _run_task(dag_id: str, task_id: str, budget_s: float) -> dict[str, Any]:
         )
     except subprocess.TimeoutExpired:
         return {"passed": False, "timed_out": True, "error": "task test timed out"}
+    output = _clean(proc.stdout + proc.stderr)
+    final_state = task_final_state(output)
     return {
-        "passed": proc.returncode == 0,
+        "passed": task_passed(proc.returncode, final_state),
         "exit_code": proc.returncode,
+        "final_state": final_state,
         "duration_s": round(time.monotonic() - started, 1),
-        "output": _clean(proc.stdout + proc.stderr),
+        "output": output,
     }
+
+
+_STATE_PATTERNS = (
+    re.compile(r"new_state=([a-z_]+)"),  # Airflow 3.x task runner
+    re.compile(r"Marking task as ([A-Z_]+)"),  # Airflow 2.x
+)
+
+
+def task_final_state(output: str) -> str | None:
+    """Last task state announced by ``airflow tasks test`` (pure function, unit-tested)."""
+    found: list[tuple[int, str]] = []
+    for pattern in _STATE_PATTERNS:
+        found += [(m.start(), m.group(1).lower()) for m in pattern.finditer(output)]
+    return max(found)[1] if found else None
+
+
+def task_passed(returncode: int, final_state: str | None) -> bool:
+    """Airflow 3.4 exits 0 even when the task FAILED: trust the announced state first."""
+    if returncode != 0:
+        return False
+    if final_state is not None:
+        return final_state == "success"
+    return True
 
 
 def main() -> int:
@@ -169,5 +200,17 @@ def main() -> int:
     return 0 if result["passed"] else 1
 
 
+def _safe_main() -> int:
+    """Always print a result line, even when Airflow itself fails (version drift, bad env):
+    the plugin then reports the real error instead of "no result line"."""
+    try:
+        return main()
+    except SystemExit:
+        raise
+    except BaseException as exc:
+        _emit({"passed": False, "stages": {}, "error": f"{type(exc).__name__}: {exc}"[:2000]})
+        return 1
+
+
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(_safe_main())

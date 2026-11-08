@@ -491,3 +491,23 @@ def test_section5_lists_each_run_under_its_own_heading(
     assert "a / a1" in lines[failed_at + 1]
     assert "b / b1" in lines[masked_at + 1]
     assert "airflow_sandbox_test b (bac à sable)" in section  # no double space
+
+
+@pytest.mark.parametrize("api_version", ["v2"])
+def test_airflow3_manual_run_without_logical_date_is_counted(
+    api_version: str, airflow: respx.MockRouter
+) -> None:
+    """Found on Airflow 3.4: a manual run has logical_date=None and, right after a retry, a
+    start_date later than the report; run_after is the stable reference."""
+    ctx = make_context(api_version="v2", auth_mode="jwt")
+    airflow.get("/dags").respond(json=collection("dags", [p.dag("v2", "manual_dag")]))
+    manual = run("m1", "failed", 2)
+    manual.update(logical_date=None, run_after=ts(2), start_date=None, end_date=None)
+    airflow.get("/dags/manual_dag/dagRuns").respond(json=collection("dag_runs", [manual]))
+    airflow.get(path__regex=r".*/taskInstances$").respond(
+        json=collection("task_instances", [ti("fetch", "failed", 1.0)])
+    )
+    airflow.get(path__regex=r".*/xcomEntries$").respond(json=collection("xcom_entries", []))
+    health = ctx.call("airflow_build_report", period="24h")["report"]["health"]
+    assert health["total_runs"] == 1
+    assert health["per_dag"][0]["status"] == "failing"

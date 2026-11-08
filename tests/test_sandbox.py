@@ -483,3 +483,65 @@ def test_refused_patches_do_not_consume_the_budget(dags: Path, api: Any) -> None
     assert ctx.call("airflow_sandbox_test", dag_id="train", patch=PATCH)["ok"] is True
     over = ctx.call("airflow_sandbox_test", dag_id="train", patch=PATCH)
     assert "budget" in over["error"]["message"]
+
+
+def test_checker_crash_is_reported_with_its_real_error() -> None:
+    """Found on Airflow 3.4: the checker crashed (DagBag API change) and the plugin only said
+    'no result line'. The checker now always emits a result carrying the real error."""
+    out = 'SANDBOX_RESULT {"passed": false, "stages": {}, "error": "TypeError: bad kwarg"}'
+    result = parse_terminal_result(terminal(out, 1), Settings())
+    assert result["passed"] is False
+    assert result["error"] == "Sandbox checker error: TypeError: bad kwarg"
+
+
+def test_runner_safe_main_emits_a_result_line(capsys: pytest.CaptureFixture[str]) -> None:
+    spec = importlib.util.spec_from_file_location(
+        "check_dag_safe", ROOT / "sandbox_runner" / "check_dag.py"
+    )
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    def boom() -> int:
+        raise RuntimeError("airflow exploded")
+
+    module.main = boom
+    assert module._safe_main() == 1
+    line = capsys.readouterr().out.strip().splitlines()[-1]
+    assert line.startswith("SANDBOX_RESULT ")
+    assert "RuntimeError: airflow exploded" in line
+
+
+@pytest.mark.parametrize(
+    ("output", "returncode", "state", "passed"),
+    [
+        # Airflow 3.4: exit code 0 although the task failed (found on a real 3.4.0 run)
+        (
+            "URLError ...\nTask instance state updated new_state=failed rows_affected=1\n"
+            "[DAG TEST] end task",
+            0,
+            "failed",
+            False,
+        ),
+        ("... new_state=success rows_affected=1", 0, "success", True),
+        # Airflow 2.x
+        ("INFO - Marking task as SUCCESS. dag_id=d", 0, "success", True),
+        ("ERROR - Task failed\nINFO - Marking task as FAILED. dag_id=d", 1, "failed", False),
+        # the LAST announced state wins (e.g. up_for_retry then failed)
+        ("new_state=up_for_retry ... new_state=failed", 0, "failed", False),
+        # no state announced: fall back to the exit code
+        ("killed", -9, None, False),
+        ("done", 0, None, True),
+    ],
+)
+def test_task_outcome_uses_the_announced_state(
+    output: str, returncode: int, state: str | None, passed: bool
+) -> None:
+    spec = importlib.util.spec_from_file_location(
+        "check_dag_state", ROOT / "sandbox_runner" / "check_dag.py"
+    )
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    assert module.task_final_state(output) == state
+    assert module.task_passed(returncode, state) is passed

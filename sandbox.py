@@ -376,6 +376,8 @@ def parse_terminal_result(raw: str, settings: Settings) -> dict[str, Any]:
 
     if parsed is not None:
         result.update(passed=bool(parsed.get("passed")), stages=parsed.get("stages", {}))
+        if parsed.get("error"):  # the in-container checker itself failed (e.g. Airflow drift)
+            result["error"] = f"Sandbox checker error: {redact_text(str(parsed['error']))}"
         task_stage = result["stages"].get("task") if isinstance(result["stages"], dict) else None
         if isinstance(task_stage, dict) and not task_stage.get("passed"):
             task_output = str(task_stage.get("output") or "")

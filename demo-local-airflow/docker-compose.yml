@@ -1,14 +1,20 @@
 # Optional, manual integration test only: a throw-away single-container Airflow 3
-# (standalone mode, SQLite, SimpleAuthManager). NOT for production.
+# (standalone mode, SQLite, SimpleAuthManager). NOT for production. Not part of the plugin.
 #
-#   docker compose -f demo-local-airflow/docker-compose.yml up
-#   -> API on http://localhost:8080, user admin / password admin (see passwords.json)
+#   docker compose -f demo-local-airflow/docker-compose.yml up -d
+#   -> REST API v2 on http://localhost:8081/api/v2, JWT via POST /auth/token,
+#      user admin / password admin (see passwords.json)
+#
+# Own project name + port 8081: it runs next to the Airflow 2.9 demo
+# (docker-compose.airflow2.yml, port 8080) instead of replacing it.
+# Plugin settings for this demo: base_url http://localhost:8081, api_version v2, auth_mode jwt.
+name: airflow3-demo
 services:
   airflow:
-    image: apache/airflow:3.1.0
+    image: apache/airflow:3.4.0
     command: standalone
     ports:
-      - "8080:8080"
+      - "8081:8080"
     environment:
       AIRFLOW__CORE__LOAD_EXAMPLES: "false"
       AIRFLOW__CORE__SIMPLE_AUTH_MANAGER_USERS: "admin:admin"
@@ -16,4 +22,6 @@ services:
       AIRFLOW__API__EXPOSE_CONFIG: "false"
     volumes:
       - ./dags:/opt/airflow/dags:ro
-      - ./passwords.json:/opt/airflow/passwords.json:ro
+      # NOT read-only: Airflow 3.4's SimpleAuthManager opens this file in append mode at startup
+      # (a ":ro" mount crashes the API server with "Read-only file system").
+      - ./passwords.json:/opt/airflow/passwords.json

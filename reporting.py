@@ -278,7 +278,13 @@ class ReportBuilder:
             return _DagData(dag, [], error=exc.to_dict())
 
     def _in_window(self, run: dict[str, Any], start: datetime) -> bool:
-        moment = parse_datetime(run.get("logical_date")) or parse_datetime(run.get("start_date"))
+        # A stable date: start_date moves when a run is cleared for a retry (and is empty while
+        # queued); Airflow 3 manual runs have no logical_date but always a run_after.
+        moment = (
+            parse_datetime(run.get("logical_date"))
+            or parse_datetime(run.get("run_after"))
+            or parse_datetime(run.get("start_date"))
+        )
         return moment is not None and start <= moment <= self.now
 
     # ------------------------------------------------------------------ section 2

@@ -9,11 +9,14 @@ Prerequisites:
     (then trigger the demo DAGs: see the README of demo-local-airflow)
 
 Usage (from the plugin root):
-    .venv/Scripts/python demo-local-airflow/e2e_walkthrough.py
+    .venv/Scripts/python demo-local-airflow/e2e_walkthrough.py                     # Airflow 2.9
+    .venv/Scripts/python demo-local-airflow/e2e_walkthrough.py --base-url http://localhost:8081 \\
+        --api-version v2 --auth jwt --image apache/airflow:3.4.0                    # Airflow 3.4
 """
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import subprocess
@@ -70,17 +73,25 @@ def show(result: dict[str, Any], keys: list[str]) -> None:
 def main() -> None:
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8")  # Windows consoles default to cp1252
+    parser = argparse.ArgumentParser(description="End-to-end walkthrough on a real Airflow")
+    parser.add_argument("--base-url", default="http://localhost:8080")
+    parser.add_argument("--api-version", choices=("v1", "v2"), default="v1")
+    parser.add_argument("--auth", choices=("basic", "token", "jwt"), default="basic")
+    parser.add_argument("--image", default="apache/airflow:2.9.3", help="sandbox image")
+    options = parser.parse_args()
+    print(f"Airflow {options.base_url} (API {options.api_version}, auth {options.auth}), "
+          f"sandbox image {options.image}")
     work = Path(tempfile.mkdtemp(prefix="airflow-mlops-e2e-"))
     harness._DATA_DIR["root"] = work / "plugin-data"
     harness.SECRETS.update({"AIRFLOW_USERNAME": "admin", "AIRFLOW_PASSWORD": "admin"})
     ctx = harness.FakeContext(
         {
-            "base_url": "http://localhost:8080",
-            "api_version": "v1",
-            "auth_mode": "basic",
+            "base_url": options.base_url,
+            "api_version": options.api_version,
+            "auth_mode": options.auth,
             "read_only": False,
             "sandbox_enabled": True,
-            "sandbox_image": "apache/airflow:2.9.3",
+            "sandbox_image": options.image,
             "sandbox_dags_path": str(PLUGIN_ROOT / "demo-local-airflow" / "dags"),
         }
     )

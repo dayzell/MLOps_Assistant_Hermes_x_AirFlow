@@ -425,6 +425,8 @@ class AirflowClient:
             "state": raw.get("state"),
             "run_type": raw.get("run_type"),
             "logical_date": raw.get("logical_date") or raw.get("execution_date"),
+            # Airflow 3: manual runs have no logical_date; run_after (trigger time) is stable
+            "run_after": raw.get("run_after"),
             "start_date": raw.get("start_date"),
             "end_date": raw.get("end_date"),
             "duration_s": duration,
