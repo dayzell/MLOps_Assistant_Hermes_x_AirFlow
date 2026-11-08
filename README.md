@@ -116,6 +116,26 @@ model:
 > Avec un contexte plus petit, Hermes refuse de répondre : « Hermes needs at least 64,000
 > tokens for reliable tool use ».
 
+**Indispensable avec un petit modèle : rendre les outils visibles.** Par défaut, Hermes met
+les outils des plugins « de côté », derrière son outil de recherche (`tool_search`) : le modèle
+ne voit pas `airflow_list_dags` directement. Un modèle de 8B ne pense pas à les chercher, et
+**invente alors une réponse**. Lors des tests, il a listé des DAGs « COVID-19 » ou « Stock
+Market » qui n'existaient pas. Ajoutez donc dans `config.yaml` :
+
+```yaml
+tools:
+  tool_search:
+    enabled: off                       # tous les outils visibles directement par le modèle
+```
+
+Et limitez Hermes aux seuls outils Airflow avec `-t airflow` : le prompt est alors beaucoup plus
+court (~850 tokens au lieu de ~8 000), donc la réponse est plus rapide.
+
+```powershell
+hermes -z "Utilise l'outil airflow_list_dags et liste mes DAGs Airflow." -t airflow
+hermes chat -t airflow
+```
+
 ### 3. Régler Ollama (une seule fois)
 
 Hermes fait aussi des **appels secondaires** au même modèle, par exemple pour générer le titre
@@ -168,17 +188,37 @@ Set-Content -Path "$env:LOCALAPPDATA\hermes\.env" -Encoding utf8 `
 hermes plugins doctor airflow-mlops
 ```
 
+### Variante recommandée : modèle cloud gratuit (Nous Portal)
+
+Pour une démonstration fluide, un modèle cloud fait nettement mieux qu'un petit modèle local.
+Hermes est fourni avec un **accès gratuit à Nous Portal** (offre « welcome », sans compte) :
+
+```powershell
+hermes model        # 1. "Nous · free tier"  →  2. un modèle ":free"  →  3. reasoning "medium"
+hermes status       # Provider: Nous Portal
+hermes -z "Liste mes DAGs Airflow." -t airflow
+```
+
+`hermes model` réécrit le bloc `model:` de `config.yaml`. Gardez `tools.tool_search.enabled`
+désactivé et l'option `-t airflow`. Validé le 08/11/2026 avec `meituan/longcat-2.5:free` :
+l'agent appelle seul `airflow_list_dags`, **sans qu'on lui nomme l'outil**, et cite les 3 vrais
+DAGs. Évitez les modèles « stealth », dont on ne connaît ni la provenance ni l'usage fait des
+échanges. Les limites d'usage de l'offre gratuite sont fixées par Nous ; avec des données
+réelles d'entreprise, tenez compte du fait que les échanges passent par leurs serveurs.
+
 ### Performances constatées et limites
 
-| Machine | Empreinte (modèle + 64k de contexte) | Répartition | 1er appel (chargement) | Appel simple ensuite |
-|---|---|---|---|---|
-| PC, RTX 2060 6 Go, 30 Go de RAM | ~13 Go | 65 % CPU / 35 % GPU | ~40 s | ~1 à 1,5 min |
+| Configuration | Empreinte locale | Appel de l'outil | Temps pour « liste mes DAGs » |
+|---|---|---|---|
+| `hermes3:8b` local, PC RTX 2060 6 Go | ~13 Go (65 % CPU / 35 % GPU) | ❌ invente une réponse, ou écrit l'appel sans le déclencher | 20 s à 4 min |
+| `meituan/longcat-2.5:free` via Nous Portal | aucune | ✅ appel réel, bons résultats | **~7 s** (2 appels au modèle) |
 
 - Les 64 000 tokens exigés par Hermes ne tiennent pas dans 6 Go de mémoire graphique : une
   grande partie tourne sur le processeur. **C'est fonctionnel mais lent.** Une tâche avec
   plusieurs appels d'outils prend plusieurs minutes.
-- Un modèle de 8B se trompe parfois : il a répondu « 11 » à « 3+4 » lors d'un test. Il faut le
-  guider en nommant l'outil à utiliser (« utilise airflow_list_dags »).
+- Un modèle de 8B se trompe parfois : il a répondu « 11 » à « 3+4 » lors d'un test.
+  `hermes3:8b` choisit bien l'outil, mais oublie les balises `<tool_call>` qu'Ollama attend pour
+  déclencher l'appel : Hermes reçoit alors un simple texte.
 - Un Mac Apple Silicon avec 16 Go de mémoire unifiée, ou un modèle hébergé, donne une
   expérience nettement plus fluide.
 
@@ -189,6 +229,8 @@ hermes plugins doctor airflow-mlops
 | « Hermes needs at least 64,000 tokens » | `ollama_num_ctx` trop petit | `ollama_num_ctx: 65536` (étape 2) |
 | `Title generation failed: Request timed out` dans `logs/agent.log` | rechargements du modèle | `OLLAMA_CONTEXT_LENGTH=65536`, puis redémarrer Ollama (étape 3) |
 | `ollama ps` affiche `CONTEXT 4096` | variables non prises en compte | redémarrer **complètement** Ollama, y compris l'icône de la barre des tâches |
+| L'agent répond sans appeler d'outil, ou invente des DAGs | outils du plugin cachés derrière `tool_search` (journal : « 0 core/visible tools kept, 9 deferred ») | `tools.tool_search.enabled: off` et `-t airflow` (étape 2) ; vérifier que la réponse cite de vrais noms de DAGs |
+| Pendant la réponse : carte graphique peu utilisée, ~9 Go de RAM pris par `ollama.exe` | modèle et contexte de 64k trop gros pour 6 Go de mémoire graphique : le calcul se fait surtout sur le processeur (~3 tokens/s) | normal sur cette machine ; voir « Performances » |
 | `ollama: command not found` dans Git Bash (VS Code) | PATH réécrit par l'extension Python | utiliser PowerShell, ou relancer la fenêtre VS Code |
 | Revenir en arrière | — | restaurer `config.yaml.bak` et supprimer les 3 variables `OLLAMA_*` |
 
