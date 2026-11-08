@@ -417,17 +417,28 @@ def update_audit_entry(entry_id: int, *, outcome: str, details: dict[str, Any] |
         )
 
 
-def count_audit_entries(tool: str, session_id: str | None, since: float = 0.0) -> int:
-    """Number of journal entries of ``tool`` for one Hermes session (budget checks)."""
+def count_audit_entries(
+    tool: str,
+    session_id: str | None,
+    since: float = 0.0,
+    outcomes: tuple[str, ...] | None = None,
+) -> int:
+    """Number of journal entries of ``tool`` for one Hermes session (budget checks).
+
+    ``outcomes`` restricts the count (e.g. only tests that actually ran).
+    """
+    query = "SELECT COUNT(*) FROM audit_log WHERE tool = ? AND ts >= ?"
+    params: list[Any] = [tool, since]
+    if session_id is None:
+        query += " AND session_id IS NULL"
+    else:
+        query += " AND session_id = ?"
+        params.append(session_id)
+    if outcomes is not None:
+        if not outcomes:
+            return 0
+        query += f" AND outcome IN ({','.join('?' for _ in outcomes)})"
+        params.extend(outcomes)
     with connect() as conn:
-        if session_id is None:
-            row = conn.execute(
-                "SELECT COUNT(*) FROM audit_log WHERE tool = ? AND session_id IS NULL AND ts >= ?",
-                (tool, since),
-            ).fetchone()
-        else:
-            row = conn.execute(
-                "SELECT COUNT(*) FROM audit_log WHERE tool = ? AND session_id = ? AND ts >= ?",
-                (tool, session_id, since),
-            ).fetchone()
+        row = conn.execute(query, params).fetchone()
     return int(row[0])

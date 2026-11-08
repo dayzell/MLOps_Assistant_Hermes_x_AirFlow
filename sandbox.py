@@ -495,7 +495,10 @@ class SandboxRunner:
             raise SandboxError(f"level must be one of {', '.join(SANDBOX_LEVELS)}.")
         if request.level == "task" and not request.task_id:
             raise SandboxError("level 'task' requires task_id.")
-        used = storage.count_audit_entries(TOOL_NAME, self.session_id)
+        # Only tests that actually ran a container count: a refused patch costs nothing.
+        used = storage.count_audit_entries(
+            TOOL_NAME, self.session_id, outcomes=("passed", "failed")
+        )
         if used >= settings.sandbox_max_tests_per_session:
             raise SandboxError(
                 f"Sandbox budget reached for this session ({used}/"

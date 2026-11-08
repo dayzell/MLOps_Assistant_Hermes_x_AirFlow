@@ -470,3 +470,16 @@ def test_stale_workspaces_are_purged(tmp_path: Path) -> None:
     assert purge_stale_workspaces(tmp_path) == 1
     assert not old.exists() and fresh.exists()
     assert purge_stale_workspaces(tmp_path / "missing") == 0
+
+
+def test_refused_patches_do_not_consume_the_budget(dags: Path, api: Any) -> None:
+    """Found in a real Hermes session: rejected diffs used up the test budget."""
+    ctx = sandbox_ctx(dags, sandbox_max_tests_per_session=1)
+    ctx.dispatch_handler = lambda tool, args: terminal(sentinel(True))
+    bad = "--- a/train.py\n+++ b/train.py\n@@ -1 +1 @@\n-not in the file\n+x\n"
+    for _ in range(3):  # refused before any container runs
+        refused = ctx.call("airflow_sandbox_test", dag_id="train", patch=bad)
+        assert "does not apply" in refused["error"]["message"]
+    assert ctx.call("airflow_sandbox_test", dag_id="train", patch=PATCH)["ok"] is True
+    over = ctx.call("airflow_sandbox_test", dag_id="train", patch=PATCH)
+    assert "budget" in over["error"]["message"]
