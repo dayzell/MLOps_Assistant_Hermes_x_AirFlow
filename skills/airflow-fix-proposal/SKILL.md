@@ -95,12 +95,20 @@ import ✅ · structure ✅ (<changes or "aucun changement de structure">) · ta
 | Missing connection / variable | Create it in Airflow (UI/CLI/secrets backend) — the human does it; give the exact conn_id |
 | Permission denied | Name the exact permission / role / path needed; never suggest running as root |
 | Recurrent OOM | Reduce batch size / chunking, or raise the task's resources (pool, executor config) |
+| Failure masked by a final `all_done` task (run marked success) | Keep the final task (cleanup / notification must still run) and add a leaf "watcher" task with `trigger_rule="one_failed"` that raises, so the run fails. Switching the final task to `all_success` hides failures from notifications: only suggest it with that trade-off stated |
 
 ## Pitfalls
 
 - Do not invent file names, line numbers or code: read them with `airflow_get_dag_source`.
 - Do not "fix" a failure by catching and ignoring the exception, or by deleting a data-quality
   check.
+- **Do not make the error disappear by changing what a task means.** Reading another key
+  (`frame["features"]` instead of `frame["target"]`), returning a default or skipping the work
+  makes the run green but the result wrong. When a producer and a consumer disagree on a data
+  contract, fix the producer (or ask the user which side is right), and validate the input
+  with a clear error.
+- A sandbox pass proves the code loads and the structure holds, not that the fix is right:
+  say so when you present it.
 - Never put secrets in the diff; reference Airflow Connections / Variables instead.
 - A sandbox pass is evidence, not a guarantee: it ran without network and on a sample.
 
