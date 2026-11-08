@@ -1,7 +1,7 @@
 ---
 name: airflow-report
 description: Produce the standard Apache Airflow monitoring report (always the same six sections — scope and period, health, per-task performance, data quality, incidents and actions, recommendations) from airflow_build_report, without inventing numbers. Use for daily/weekly pipeline status, health checks, SLA or performance reviews, or when the user runs /airflow-report.
-version: 0.5.0
+version: 0.6.0
 author: Joseph Keita
 license: MIT
 metadata:

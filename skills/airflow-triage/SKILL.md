@@ -1,7 +1,7 @@
 ---
 name: airflow-triage
 description: Diagnose a failed or retrying Apache Airflow DAG run — find the root-cause task, read its error, XComs and dependencies, classify the failure (transient or critical) and propose the minimal remediation. Use whenever a DAG run, task or pipeline has failed, is stuck in retries, or a user asks "why did my DAG fail?".
-version: 0.5.0
+version: 0.6.0
 author: Joseph Keita
 license: MIT
 metadata:
@@ -31,6 +31,7 @@ remediation. Reply in the user's language.
 | More log context for one task | `airflow_get_task_logs(dag_id, run_id, task_id, try_number?)` |
 | Inputs / outputs of a task | `airflow_get_xcoms(dag_id, run_id, task_id)` |
 | Wider blast radius | `airflow_get_dependencies(dag_id, task_id, depth)` |
+| Code of the DAG (before any fix) | `airflow_get_dag_source(dag_id, start_line?, end_line?)` |
 | Remediation (only if exposed) | `airflow_clear_tasks(..., dry_run=true)` first |
 
 ## Procedure

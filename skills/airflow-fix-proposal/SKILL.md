@@ -1,7 +1,7 @@
 ---
 name: airflow-fix-proposal
 description: Write a fix proposal for a critical Apache Airflow failure — probable cause, suggested correction as a unified diff, risks, and how to verify — for a human to review and apply. Use after airflow-triage classified a failure as critical (code, data, schema, permission or configuration error). The agent proposes; it never patches DAG code itself.
-version: 0.5.0
+version: 0.6.0
 author: Joseph Keita
 license: MIT
 metadata:
@@ -28,12 +28,16 @@ user's language.
 
 1. **Gather evidence** (from `airflow_diagnose_run`, then targeted tools if needed):
    the `error_block` (file, line, exception), the task's XCom inputs, `dag_params`, the task
-   `operator` and `trigger_rule`. If the user shares the DAG source, read the exact lines.
+   `operator` and `trigger_rule`.
+   **Then read the real code with `airflow_get_dag_source(dag_id)`** (for long files, a window
+   around the traceback line with `start_line`/`end_line`). Never guess the code: a diff only
+   applies if its context lines are copied exactly from `content`.
 2. **State the probable cause** in one or two sentences, quoting the decisive log line. Say
    how confident you are and what would confirm it.
-3. **Propose the correction as a unified diff** against the DAG file named in the traceback.
-   Keep it minimal and focused on the cause. If you do not have the source, write the diff
-   on the lines visible in the traceback and say it must be adapted.
+3. **Propose the correction as a unified diff**, built from the `content` returned by
+   `airflow_get_dag_source`, with its `path` in the headers (`--- a/<path>` / `+++ b/<path>`).
+   Keep it minimal and focused on the cause. If the tool reports `differs_from_deployed`, tell
+   the user that the local code is not what Airflow runs.
 4. **Test it in the sandbox when available** (`airflow_sandbox_test`, hidden when the
    sandbox is disabled):
    - always start with `level="import"`, then `level="structure"` with the `task_id`;
@@ -94,8 +98,7 @@ import ✅ · structure ✅ (<changes or "aucun changement de structure">) · ta
 
 ## Pitfalls
 
-- Do not invent file names or line numbers: take them from the traceback, or say they are
-  unknown.
+- Do not invent file names, line numbers or code: read them with `airflow_get_dag_source`.
 - Do not "fix" a failure by catching and ignoring the exception, or by deleting a data-quality
   check.
 - Never put secrets in the diff; reference Airflow Connections / Variables instead.

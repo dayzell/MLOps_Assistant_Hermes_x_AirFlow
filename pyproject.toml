@@ -1,6 +1,6 @@
 [project]
 name = "airflow-mlops"
-version = "0.5.0"
+version = "0.6.0"
 description = "Hermes Agent plugin: Apache Airflow monitoring, diagnosis, targeted retries and reports"
 readme = "README.md"
 license = { text = "MIT" }

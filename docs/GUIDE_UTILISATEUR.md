@@ -4,7 +4,7 @@ Ce guide explique **ce que l'agent sait faire**, **les outils qu'il utilise** et
 que vous pouvez changer**, sans entrer dans le code. Pour les détails techniques, voir le
 [README](../README.md).
 
-> Version décrite : **0.5.0**.
+> Version décrite : **0.6.0**.
 
 ---
 
@@ -88,6 +88,7 @@ Exemples : `/airflow-report`, `/airflow-report train_model 7d`, `/airflow-report
 | `airflow_get_task_logs` | Fin du log d'une tâche et **bloc d'erreur extrait** | `dag_id`, `run_id`, `task_id`, `try_number` |
 | `airflow_get_xcoms` | Données échangées entre tâches (masquées, tronquées) | `dag_id`, `run_id`, `task_id`, `key` |
 | `airflow_get_dependencies` | Tâches en amont et en aval, avec leur règle de déclenchement | `dag_id`, `task_id`, `depth` |
+| `airflow_get_dag_source` | Le code du DAG (secrets masqués), pour écrire un correctif juste | `dag_id`, `start_line`, `end_line` |
 | `airflow_diagnose_run` | **Diagnostic complet d'une panne en un appel** (voir § 5.1) | `dag_id`, `run_id` |
 | `airflow_build_report` | **Rapport normé en 6 sections** (voir § 5.2) | `scope`, `period` |
 
@@ -113,7 +114,7 @@ Cet outil est **invisible pour l'agent** tant que `sandbox_enabled` vaut `false`
 |---|---|
 | `airflow-triage` | La méthode de diagnostic : trouver la cause racine, lire les preuves, relancer le minimum |
 | `airflow-report` | La présentation du rapport : résumé, puis les 6 sections, sans chiffre inventé |
-| `airflow-fix-proposal` | La proposition de correctif : cause, diff, **test en bac à sable**, risques, vérification. **Jamais appliquée par l'agent.** |
+| `airflow-fix-proposal` | La proposition de correctif : **lecture du code**, cause, diff, **test en bac à sable**, risques, vérification. **Jamais appliquée par l'agent.** |
 
 ---
 

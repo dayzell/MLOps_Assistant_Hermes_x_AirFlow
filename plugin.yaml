@@ -1,5 +1,5 @@
 name: airflow-mlops
-version: 0.5.0
+version: 0.6.0
 description: Apache Airflow MLOps assistant — monitor DAGs, diagnose failed runs, targeted retries and standard reports
 author: Joseph Keita
 manifest_version: 2
@@ -20,6 +20,7 @@ provides_tools:
   - airflow_get_task_logs
   - airflow_get_xcoms
   - airflow_get_dependencies
+  - airflow_get_dag_source
   - airflow_diagnose_run
   - airflow_build_report
   - airflow_clear_tasks

@@ -323,6 +323,23 @@ class AirflowClient:
         )
         return dag
 
+    def get_dag_source(self, dag_id: str) -> str:
+        """Python source of the file defining ``dag_id``, as deployed in Airflow.
+
+        v1 (2.x): ``GET /dags/{id}`` -> ``file_token`` -> ``GET /dagSources/{file_token}``
+        (verified on Airflow 2.9). v2 (3.x): ``GET /dagSources/{dag_id}``.
+        """
+        if self.is_v2:
+            body = self._get_json(f"/dagSources/{_seg(dag_id)}")
+        else:
+            dag = self._get_json(f"/dags/{_seg(dag_id)}")
+            token = dag.get("file_token") if isinstance(dag, dict) else None
+            if not token:
+                raise AirflowError("not_found", f"Airflow returned no source file for '{dag_id}'.")
+            body = self._get_json(f"/dagSources/{_seg(str(token))}")
+        content = body.get("content") if isinstance(body, dict) else body
+        return str(content or "")
+
     def get_tasks(self, dag_id: str) -> list[dict[str, Any]]:
         raw = self._get_json(f"/dags/{_seg(dag_id)}/tasks")
         tasks = (raw.get("tasks") or []) if isinstance(raw, dict) else []

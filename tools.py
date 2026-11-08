@@ -15,6 +15,7 @@ from typing import Any
 
 from .airflow_client import AirflowError
 from .config import DagNotAllowedError, Settings
+from .dag_source import read_dag_source
 from .diagnosis import RunDiagnoser, load_rules
 from .guardrails import ClearRequest, ClearTasksAction, GuardrailError
 from .redaction import redact_text, redact_value
@@ -148,6 +149,7 @@ class ReadTools:
             "airflow_get_task_logs": safe_handler(self.get_task_logs),
             "airflow_get_xcoms": safe_handler(self.get_xcoms),
             "airflow_get_dependencies": safe_handler(self.get_dependencies),
+            "airflow_get_dag_source": safe_handler(self.get_dag_source),
             "airflow_diagnose_run": safe_handler(self.diagnose_run),
             "airflow_build_report": safe_handler(self.build_report),
         }
@@ -308,6 +310,25 @@ class ReadTools:
         if graph is None:
             return error("not_found", f"Task '{task_id}' does not exist in DAG '{dag_id}'.", 404)
         return ok(dag_id=dag_id, depth=depth, **graph)
+
+    # -- airflow_get_dag_source
+    def get_dag_source(self, args: dict[str, Any]) -> str:
+        settings = self.runtime.settings()
+        dag_id = _require_str(args, "dag_id")
+        _check_allowed(settings, dag_id)
+        start_line = _optional_int(args, "start_line", None, 1)
+        end_line = _optional_int(args, "end_line", None, 1)
+        try:
+            result = read_dag_source(
+                self.runtime.client(settings),
+                settings,
+                dag_id,
+                start_line=start_line,
+                end_line=end_line,
+            )
+        except ValueError as exc:
+            raise ToolInputError(str(exc)) from exc
+        return ok(**result)
 
     # -- airflow_diagnose_run
     def diagnose_run(self, args: dict[str, Any]) -> str:

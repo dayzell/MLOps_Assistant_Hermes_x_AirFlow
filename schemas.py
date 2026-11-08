@@ -174,6 +174,34 @@ AIRFLOW_GET_DEPENDENCIES: dict[str, Any] = {
     },
 }
 
+AIRFLOW_GET_DAG_SOURCE: dict[str, Any] = {
+    "name": "airflow_get_dag_source",
+    "description": (
+        "Read the Python source code of the file that defines a DAG (secrets masked). Read-only. "
+        "Call it BEFORE writing a fix: a diff only applies if its context lines are copied "
+        "exactly from this code. Returns 'path' (use it in the diff headers), 'content', "
+        "'first_line'/'last_line' and the origin (local DAGs folder or Airflow). For long files, "
+        "read a window around the line reported in the traceback with start_line/end_line."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "dag_id": _DAG_ID,
+            "start_line": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "First line to return (default 1).",
+            },
+            "end_line": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "Last line to return (default: end of file).",
+            },
+        },
+        "required": ["dag_id"],
+    },
+}
+
 AIRFLOW_DIAGNOSE_RUN: dict[str, Any] = {
     "name": "airflow_diagnose_run",
     "description": (
@@ -234,6 +262,7 @@ READ_TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
         AIRFLOW_GET_TASK_LOGS,
         AIRFLOW_GET_XCOMS,
         AIRFLOW_GET_DEPENDENCIES,
+        AIRFLOW_GET_DAG_SOURCE,
         AIRFLOW_DIAGNOSE_RUN,
         AIRFLOW_BUILD_REPORT,
     )

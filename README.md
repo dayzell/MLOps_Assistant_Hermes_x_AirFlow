@@ -3,7 +3,7 @@
 Plugin **Hermes Agent** autonome qui transforme l'agent en assistant MLOps pour **Apache Airflow** :
 surveillance des DAGs, diagnostic de pannes, relance ciblée et protégée, rapports de monitoring normés.
 
-> **État : v0.5.0 — phases 1 à 5 livrées**
+> **État : v0.6.0 — phases 1 à 5 livrées**
 > - Fait : outils en lecture seule, redaction, diagnostic de panne avec classification
 >   transient / critical, rapports normés, commande `/airflow-report`, 3 skills, et
 >   remédiation protégée (relance ciblée, approbation humaine, politique de relance
@@ -251,6 +251,7 @@ n'exposent jamais de traceback.
 | `airflow_get_task_logs` | Log d'un try : tail borné et bloc d'erreur/traceback extrait |
 | `airflow_get_xcoms` | XComs d'une tâche, masqués et tronqués |
 | `airflow_get_dependencies` | Graphe amont/aval d'une tâche avec `trigger_rule` |
+| `airflow_get_dag_source` | Code source du DAG (secrets masqués) : lu dans le dossier local `sandbox_dags_path` s'il est configuré, sinon via l'API Airflow. Signale si le code local diffère du code déployé. Plage de lignes possible |
 | `airflow_diagnose_run` | Diagnostic complet d'un run en échec : racine vs impactées, logs, XComs, classification justifiée |
 | `airflow_build_report` | Rapport de monitoring normé (6 sections, JSON + Markdown) |
 | `airflow_sandbox_test` | Teste un correctif (diff) dans un conteneur Docker jetable, sans réseau ni secrets ; masqué si `sandbox_enabled: false` |
@@ -377,7 +378,7 @@ Elles sont enregistrées via `ctx.register_skill` et accessibles sous le nom
 |---|---|
 | `airflow-triage` | Procédure de diagnostic : trouver la racine, lire logs / XComs / dépendances, classifier, proposer. Relancer le minimum, jamais le DAG entier, toujours un *dry run* d'abord. |
 | `airflow-report` | Présentation du rapport normé : résumé exécutif, puis les 6 sections inchangées. Aucun chiffre inventé. |
-| `airflow-fix-proposal` | Proposition de correctif pour une erreur critique : cause probable, diff, risques, vérification. L'agent propose, il n'applique jamais de patch. |
+| `airflow-fix-proposal` | Proposition de correctif pour une erreur critique : l'agent **lit le code** (`airflow_get_dag_source`), écrit le diff, le teste en bac à sable, puis indique les risques et la vérification. L'agent propose, il n'applique jamais de patch. |
 
 ## Remédiation protégée (`airflow_clear_tasks`)
 
@@ -557,7 +558,7 @@ Le projet a trois niveaux de vérification, du plus rapide au plus réaliste :
 | 3. Test Docker du bac à sable | `python demo-local-airflow/sandbox_smoke_test.py` | ~2–3 min | de vrais conteneurs Airflow |
 | 4. Test de bout en bout | `python demo-local-airflow/e2e_walkthrough.py` | ~1 min | un vrai serveur Airflow et ses vraies réponses |
 
-### 1. Tests unitaires (`pytest`, 297 tests)
+### 1. Tests unitaires (`pytest`, 320 tests)
 
 Ils simulent l'API Airflow avec `respx`, au format exact des versions **v1** (Airflow 2.x) et
 **v2** (Airflow 3.x). La plupart des tests tournent sur les deux versions. Les modules hôtes de
@@ -572,9 +573,10 @@ Docker n'est nécessaire.
 | [test_redaction.py](tests/test_redaction.py) | 32 | Masquage de chaque forme de secret, et le texte normal laissé intact |
 | [test_classification.py](tests/test_classification.py) | 33 | 22 erreurs réelles classées `transient` / `critical`, priorité du critique, OOM récurrent, règles personnalisées |
 | [test_diagnosis.py](tests/test_diagnosis.py) | 20 | Diagnostic de bout en bout : racine, échecs secondaires, tâches impactées, échecs masqués, XComs, cache |
-| [test_reporting.py](tests/test_reporting.py) | 51 | **Forme du rapport** (6 sections, toujours dans le même ordre), échecs masqués, calculs, ligne de base, SLA, qualité des données, commande `/airflow-report` |
+| [test_reporting.py](tests/test_reporting.py) | 55 | **Forme du rapport** (6 sections, toujours dans le même ordre), échecs masqués, calculs, ligne de base, SLA, qualité des données, commande `/airflow-report` |
 | [test_guardrails.py](tests/test_guardrails.py) | 47 | **Garde-fous** : aucune tâche réussie relancée, refus du DAG entier, `dry_run` par défaut, refus du critique, limite et backoff des relances automatiques, hook d'approbation, journal obligatoire |
-| [test_sandbox.py](tests/test_sandbox.py) | 35 | Application des diffs, chemins interdits, commande Docker bridée, lecture des résultats (OOM, timeout, réseau), budget, nettoyage |
+| [test_dag_source.py](tests/test_dag_source.py) | 18 | Lecture du code d'un DAG : API v1/v2, dossier local prioritaire, écart avec le code déployé, plages de lignes, masquage, et un diff construit à partir du code lu qui s'applique bien |
+| [test_sandbox.py](tests/test_sandbox.py) | 36 | Application des diffs, chemins interdits, commande Docker bridée, lecture des résultats (OOM, timeout, réseau), budget, nettoyage |
 | [test_storage.py](tests/test_storage.py) | 3 | Base SQLite : migrations et cache des diagnostics |
 | [test_skills.py](tests/test_skills.py) | 7 | Format des 3 skills, et outils cités qui existent bien |
 | [test_register.py](tests/test_register.py) | 7 | Manifest identique à ce que `register()` enregistre, aucun appel réseau au chargement, aucune lecture de `.env` |
