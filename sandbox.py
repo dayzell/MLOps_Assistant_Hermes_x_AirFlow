@@ -15,6 +15,7 @@ Levels: ``import`` < ``structure`` < ``task`` (see sandbox_runner/check_dag.py).
 
 from __future__ import annotations
 
+import difflib
 import json
 import logging
 import re
@@ -260,6 +261,91 @@ def purge_stale_workspaces(root: Path, max_age_s: float = STALE_WORKSPACE_SECOND
         except OSError:
             continue
     return removed
+
+
+# ============================================================================ presenting a fix
+
+MAX_SHOWN_LINES = 40
+MAX_KEPT_PATCHES = 50
+
+
+def _read_exact(path: Path) -> list[str]:
+    """Lines with their original endings (read_text() would turn CRLF into LF)."""
+    if not path.is_file():
+        return []
+    return path.read_bytes().decode("utf-8", errors="replace").splitlines(keepends=True)
+
+
+_EOL = "\r\n"
+
+
+def _numbered(lines: list[str], start: int, end: int) -> str:
+    shown = [f"{n + 1:>4} | {lines[n].rstrip(_EOL)}" for n in range(start, end)]
+    if len(shown) > MAX_SHOWN_LINES:
+        hidden = len(shown) - MAX_SHOWN_LINES
+        shown = [*shown[:MAX_SHOWN_LINES], f"     | ... ({hidden} more line(s))"]
+    return "\n".join(shown)
+
+
+def describe_changes(
+    source_root: Path, copy_root: Path, rel_paths: list[str]
+) -> tuple[list[dict[str, Any]], str]:
+    """Exact location of every change (computed from the files, not from the LLM's hunk
+    headers, which are often wrong) and a clean, standard unified diff of the fix."""
+    changes: list[dict[str, Any]] = []
+    patch_parts: list[str] = []
+    for rel in rel_paths:
+        source = source_root / rel
+        before, after = _read_exact(source), _read_exact(copy_root / rel)
+        patch_parts.append("".join(difflib.unified_diff(before, after, f"a/{rel}", f"b/{rel}")))
+        blocks: list[dict[str, Any]] = []
+        matcher = difflib.SequenceMatcher(a=before, b=after, autojunk=False)
+        for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+            if tag == "equal":
+                continue
+            blocks.append(
+                {
+                    "kind": {"replace": "modified", "delete": "removed", "insert": "added"}[tag],
+                    "lines_before": [i1 + 1, i2] if i2 > i1 else None,
+                    "lines_after": [j1 + 1, j2] if j2 > j1 else None,
+                    "after_line": i1 if tag == "insert" else None,
+                    "before": _numbered(before, i1, i2),
+                    "after": _numbered(after, j1, j2),
+                }
+            )
+        changes.append(
+            {
+                "file": rel,
+                "local_path": source.resolve().as_posix(),
+                "new_file": not source.is_file(),
+                "blocks": blocks[:20],
+            }
+        )
+    return changes, "".join(patch_parts)
+
+
+def save_patch(patch: str, dag_id: str) -> Path:
+    """Keep the tested fix as a standard .patch file in the plugin data folder (never in the
+    user's repository); only the most recent ones are kept."""
+    folder: Path = Path(plugin_data_dir(PLUGIN_NAME)) / "patches"
+    folder.mkdir(parents=True, exist_ok=True)
+    safe_dag = re.sub(r"[^A-Za-z0-9._-]", "_", dag_id)[:60]
+    path = folder / f"{time.strftime('%Y%m%d-%H%M%S')}-{safe_dag}-{uuid.uuid4().hex[:6]}.patch"
+    path.write_bytes(patch.encode("utf-8"))  # bytes: no newline translation on Windows
+    for old in sorted(folder.glob("*.patch"))[:-MAX_KEPT_PATCHES]:
+        old.unlink(missing_ok=True)
+    return path
+
+
+def apply_commands(dags_root: Path, patch_file: Path) -> dict[str, str]:
+    """Commands for the user to apply the reviewed fix (git apply works in or out of a repo)."""
+    root = shlex.quote(dags_root.resolve().as_posix())
+    patch = shlex.quote(patch_file.resolve().as_posix())
+    return {
+        "check": f"git -C {root} apply --check {patch}",
+        "apply": f"git -C {root} apply {patch}",
+        "undo": f"git -C {root} apply -R {patch}",
+    }
 
 
 def host_path(path: Path) -> str:
@@ -529,6 +615,8 @@ class SandboxRunner:
             dags_copy.mkdir(parents=True)
             copied = copy_dags_folder(dags_path, dags_copy)
             patched = apply_unified_diff(dags_copy, request.patch)
+            changes, clean_patch = describe_changes(dags_path, dags_copy, patched)
+            patch_file = save_patch(clean_patch, request.dag_id)
             shutil.copy2(RUNNER_SOURCE, workspace / "check_dag.py")
             expected = {str(t["task_id"]): list(t.get("downstream_task_ids") or []) for t in tasks}
             (workspace / "expected_structure.json").write_text(json.dumps(expected), "utf-8")
@@ -558,6 +646,15 @@ class SandboxRunner:
                 duration_s=round(time.monotonic() - started, 1),
                 patched_files=patched,
                 files_copied=copied,
+                your_files_modified=False,
+                changes=changes,
+                patch_file=patch_file.as_posix(),
+                apply_commands=apply_commands(dags_path, patch_file),
+                note=(
+                    "Tested on a temporary copy: the user's DAG files were NOT modified. Show "
+                    "'changes' (exact file and lines) and the result, then stop: the user "
+                    "chooses whether to have the file edited or to run 'apply_commands'."
+                ),
                 limits={
                     "cpus": self.settings.sandbox_cpus,
                     "memory": self.settings.sandbox_memory,

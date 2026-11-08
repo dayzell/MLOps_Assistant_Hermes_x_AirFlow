@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -201,11 +202,11 @@ def test_report_has_the_fixed_shape_and_metrics(
     assert health["success_rate"] == pytest.approx(5 / 6, abs=1e-4)
     # per-DAG statuses; global = derived from DAGs (1 of 2 failing -> half -> failing)
     statuses = {d["dag_id"]: (d["status"], d["status_reason"]) for d in health["per_dag"]}
-    assert statuses["train"] == ("healthy", "aucun incident")
-    assert statuses["etl"] == ("failing", "dernier run en échec")
+    assert statuses["train"] == ("healthy", "no incident")
+    assert statuses["etl"] == ("failing", "latest run failed")
     assert health["dag_status_counts"] == {"failing": 1, "degraded": 0, "healthy": 1, "no_data": 0}
     assert health["status"] == "failing"
-    assert health["status_reason"] == "1 DAG(s) sur 2 en échec : etl (dernier run en échec)"
+    assert health["status_reason"] == "1 of 2 DAG(s) failing: etl (latest run failed)"
     assert health["incidents"] == 1
 
     tasks = {(t["dag_id"], t["task_id"]): t for t in report["performance"]["tasks"]}
@@ -241,8 +242,21 @@ def test_markdown_always_has_the_six_sections_in_order(
     assert positions == sorted(positions)
     for key in SECTION_KEYS:
         assert markdown.count(f"## {SECTION_TITLES[key]}") == 1
-    assert "non instrumenté" in markdown  # etl has no data-quality XCom
-    assert "SLA : non configuré" in markdown
+    assert "etl: not instrumented" in markdown  # etl has no data-quality XCom
+    assert "SLA: not configured" in markdown
+
+
+def test_report_ends_by_asking_which_dags_to_diagnose(
+    api_version: str, airflow: respx.MockRouter, ctx: FakeContext
+) -> None:
+    """Flow: the report is the state of play; the user then picks what to diagnose."""
+    mock_airflow(airflow, api_version)
+    result = ctx.call("airflow_build_report", period="24h")
+    failing = {r["dag_id"] for r in result["report"]["incidents"]["failed_runs"]}
+    assert failing
+    last = result["markdown"].rstrip().splitlines()[-1]
+    assert last.startswith("➡️ **Next step**: tell me which DAG(s) to diagnose")
+    assert all(dag_id in last for dag_id in failing)
 
 
 def test_empty_scope_keeps_the_same_structure(
@@ -254,9 +268,10 @@ def test_empty_scope_keeps_the_same_structure(
     assert tuple(report) == SECTION_KEYS
     assert report["health"]["status"] == "no_data"
     assert report["data_quality"]["status"] == "not_instrumented"
-    assert report["recommendations"][0]["message"].startswith("Aucune action requise")
+    assert report["recommendations"][0]["message"].startswith("No action required")
     for key in SECTION_KEYS:
         assert f"## {SECTION_TITLES[key]}" in result["markdown"]
+    assert "Next step" not in result["markdown"]  # nothing to diagnose
 
 
 def test_baseline_trend_and_update(
@@ -269,7 +284,7 @@ def test_baseline_trend_and_update(
     assert fit["baseline_p50_s"] == 50.0
     assert fit["trend"] == "slower"
     assert fit["change_vs_baseline"] == 1.0  # 100 s vs 50 s
-    assert any("plus lente" in r["message"] for r in report["recommendations"])
+    assert any("slower than its baseline" in r["message"] for r in report["recommendations"])
     updated = storage.get_baselines("train")["fit"]
     assert updated.p50 == pytest.approx(0.7 * 50 + 0.3 * 100)
     assert updated.samples == 13
@@ -391,7 +406,7 @@ def test_slash_command_returns_markdown(
     command = ctx.commands["airflow-report"]
     assert command["args_hint"]
     text = command["handler"]("train 24h")
-    assert text.startswith("# Rapport de monitoring Airflow — train — 24h")
+    assert text.startswith("# Airflow monitoring report — train — 24h")
 
 
 def test_slash_command_reports_errors_as_text(ctx: FakeContext) -> None:
@@ -419,13 +434,16 @@ def test_masked_failures_in_success_runs(
     assert report["health"]["incidents"] == 1
     # the latest run hides a failed task: this DAG is broken right now
     assert report["health"]["status"] == "failing"
-    assert report["health"]["per_dag"][0]["status_reason"].startswith("échec masqué")
+    assert (
+        report["health"]["per_dag"][0]["status_reason"]
+        == "latest run marked success but a task failed"
+    )
     masked = report["incidents"]["failed_runs"][0]
     assert masked["masked"] is True and masked["failed_tasks"] == ["train"]
     assert report["incidents"]["masked_run_count"] == 1
     assert report["recommendations"][0]["severity"] == "high"
     assert "trigger_rule" in report["recommendations"][0]["message"]
-    assert "échec masqué" in result["markdown"]
+    assert "latest run marked success but a task failed" in result["markdown"]
 
 
 def test_one_recovered_dag_among_several_is_only_degraded(
@@ -450,9 +468,9 @@ def test_one_recovered_dag_among_several_is_only_degraded(
     result = ctx.call("airflow_build_report", period="24h")
     health = result["report"]["health"]
     assert health["status"] == "degraded"
-    assert health["status_reason"].startswith("1 DAG(s) dégradé(s) : a (1 incident(s)")
+    assert health["status_reason"].startswith("1 DAG(s) degraded: a (1 incident(s)")
     assert "🟠 degraded" in result["markdown"]
-    assert "- Statut : **degraded** — 1 DAG(s) dégradé(s)" in result["markdown"]
+    assert "- Status: **degraded** — 1 DAG(s) degraded" in result["markdown"]
 
 
 def test_section5_lists_each_run_under_its_own_heading(
@@ -486,11 +504,11 @@ def test_section5_lists_each_run_under_its_own_heading(
     markdown = ctx.call("airflow_build_report", period="24h")["markdown"]
     section = markdown.split("## 5.")[1].split("## 6.")[0]
     lines = [line for line in section.splitlines() if line.strip()]
-    failed_at = next(i for i, line in enumerate(lines) if line.startswith("- Runs en échec"))
-    masked_at = next(i for i, line in enumerate(lines) if "masquent un échec" in line)
+    failed_at = next(i for i, line in enumerate(lines) if line.startswith("- Failed runs"))
+    masked_at = next(i for i, line in enumerate(lines) if "hide a failure" in line)
     assert "a / a1" in lines[failed_at + 1]
     assert "b / b1" in lines[masked_at + 1]
-    assert "airflow_sandbox_test b (bac à sable)" in section  # no double space
+    assert "airflow_sandbox_test b (sandbox)" in section  # no double space
 
 
 @pytest.mark.parametrize("api_version", ["v2"])
@@ -511,3 +529,74 @@ def test_airflow3_manual_run_without_logical_date_is_counted(
     health = ctx.call("airflow_build_report", period="24h")["report"]["health"]
     assert health["total_runs"] == 1
     assert health["per_dag"][0]["status"] == "failing"
+
+
+def test_tables_are_aligned_for_raw_terminal_output(
+    api_version: str, airflow: respx.MockRouter, ctx: FakeContext
+) -> None:
+    """User report: /airflow-report is shown as raw text, so table columns must line up
+    (emoji count as two columns) and the long status reasons stay out of the cells."""
+    from airflow_mlops.reporting import _display_width
+
+    mock_airflow(airflow, api_version)
+    markdown = ctx.call("airflow_build_report", period="24h")["markdown"]
+    for section in ("## 2.", "## 3."):
+        block = markdown.split(section)[1].split("\n## ")[0]
+        table = [line for line in block.splitlines() if line.startswith("|")]
+        assert len(table) >= 3, section
+        # every row (header, separator, data) has the same display width...
+        widths = {_display_width(line) for line in table}
+        assert len(widths) == 1, f"{section} rows have different widths: {widths}"
+        # ...and the same number of columns
+        assert len({line.count("|") for line in table}) == 1
+    health = markdown.split("## 2.")[1].split("\n## ")[0]
+    assert "| 🔴 failing " in health  # short status cell
+    assert "- 🔴 etl: latest run failed" in health  # the reason is listed under the table
+
+
+def test_report_is_in_english(
+    api_version: str, airflow: respx.MockRouter, ctx: FakeContext
+) -> None:
+    mock_airflow(airflow, api_version)
+    result = ctx.call("airflow_build_report", period="24h")
+    text = result["markdown"] + json.dumps(result["report"], ensure_ascii=False)
+    assert "Overall health" in text and "Recommendations" in text
+    for french in ("Santé", "Recommandations", "échec", "aucun", "période", "Statut"):
+        assert french not in text, french
+
+
+def test_section5_summarises_many_actions(
+    api_version: str, airflow: respx.MockRouter, ctx: FakeContext
+) -> None:
+    """A real session listed 20 sandbox lines: counts first, then only the latest few."""
+    for outcome in ["passed"] * 14 + ["failed"] + ["refused"] * 2:
+        storage.add_audit_entry(
+            tool="airflow_sandbox_test",
+            dag_id="etl",
+            run_id=None,
+            task_ids=[],
+            dry_run=True,
+            auto=False,
+            reason="",
+            outcome=outcome,
+        )
+    storage.add_audit_entry(
+        tool="airflow_clear_tasks",
+        dag_id="etl",
+        run_id="e3",
+        task_ids=["load"],
+        dry_run=False,
+        auto=False,
+        reason="retry",
+        outcome="cleared",
+    )
+    mock_airflow(airflow, api_version)
+    markdown = ctx.call("airflow_build_report", period="24h")["markdown"]
+    section = markdown.split("## 5.")[1].split("## 6.")[0]
+    assert (
+        "- Actions taken: 18 — sandbox tests 17 (failed 1, passed 14, refused 2) · "
+        "retries 1 executed, 0 preview(s)" in section
+    )
+    listed = [line for line in section.splitlines() if line.startswith("  - 20")]
+    assert len(listed) == 5 and "airflow_clear_tasks" in listed[0]  # the real retry first
+    assert "13 older action(s) not listed" in section

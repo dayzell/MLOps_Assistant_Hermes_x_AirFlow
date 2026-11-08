@@ -84,7 +84,10 @@ def test_critical_failure_root_secondary_and_impacted(
     )
     result = ctx.call("airflow_diagnose_run", dag_id="train", run_id="run_1")
     assert result["ok"] is True, result
-    assert result["status"] == "failed"
+    assert result["outcome"] == "failed"
+    # Hermes marks a result as a failed call when its top-level "status" is failed/error
+    # (seen in a real session: "airflow_diagnose_run [failed]" on a successful diagnosis).
+    assert "status" not in result and not result.get("error")
 
     # Root vs secondary vs impacted
     assert [r["task_id"] for r in result["root_failures"]] == ["transform"]
@@ -153,7 +156,7 @@ def test_no_failure(api_version: str, airflow: respx.MockRouter, ctx: FakeContex
     )
     result = ctx.call("airflow_diagnose_run", dag_id="train", run_id="run_1")
     assert result["ok"] is True
-    assert result["status"] == "no_failure"
+    assert result["outcome"] == "no_failure"
     assert result["state_counts"] == {"success": 2}
     assert "root_failures" not in result
 
@@ -167,7 +170,7 @@ def test_retrying_only(api_version: str, airflow: respx.MockRouter, ctx: FakeCon
         run_state="running",
     )
     result = ctx.call("airflow_diagnose_run", dag_id="train", run_id="run_1")
-    assert result["status"] == "retrying"
+    assert result["outcome"] == "retrying"
     assert result["root_failures"] == []
     assert result["retrying"][0]["classification"]["category"] == "transient"
     assert result["summary"]["category"] == "transient"
@@ -251,5 +254,5 @@ def test_masked_failure_is_flagged(
         run_state="success",
     )
     result = ctx.call("airflow_diagnose_run", dag_id="train", run_id="run_1")
-    assert result["status"] == "failed"
+    assert result["outcome"] == "failed"
     assert "trigger_rule" in result["masked_failure"]

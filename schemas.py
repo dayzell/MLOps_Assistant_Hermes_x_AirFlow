@@ -367,3 +367,82 @@ AIRFLOW_SANDBOX_TEST: dict[str, Any] = {
 SANDBOX_TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
     AIRFLOW_SANDBOX_TEST["name"]: AIRFLOW_SANDBOX_TEST
 }
+
+
+# ---------------------------------------------------------------------------- guided audit
+
+AIRFLOW_AUDIT_PLAN: dict[str, Any] = {
+    "name": "airflow_audit_plan",
+    "description": (
+        "Guided audit: diagnose the latest failing run of each listed DAG and build the "
+        "numbered plan (DAG 1 -> 1.1, 1.2...; numbers stay the same for the whole audit). "
+        "Returns plan_text and next_question (ask it with the clarify tool, options as given). "
+        "Without dag_ids, returns the audit in progress (to resume it). Never changes Airflow."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "dag_ids": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "DAGs to diagnose and add to the plan (allowlist applies).",
+            },
+        },
+        "required": [],
+    },
+}
+
+AIRFLOW_AUDIT_SELECT: dict[str, Any] = {
+    "name": "airflow_audit_select",
+    "description": (
+        "Guided audit: select what to handle now from the numbered plan, with the user's own "
+        "words: '1.1', '1.1, 2.3', '1.1-1.3', 'DAG 2', a DAG id, 'all', 'all critical', "
+        "'all transient', 'all except 2.1'. Returns the current item and what to do next "
+        "(next_action or next_question)."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "selection": {"type": "string", "description": "The selection, as typed."},
+        },
+        "required": ["selection"],
+    },
+}
+
+AIRFLOW_AUDIT_PROGRESS: dict[str, Any] = {
+    "name": "airflow_audit_progress",
+    "description": (
+        "Guided audit: record a step on an item and get the next question. States: "
+        "fix_proposed (fix shown), sandbox_passed / sandbox_failed (usually recorded "
+        "automatically by airflow_sandbox_test), applied (the user's file now has the fix), "
+        "retried, verified (run OK), skipped, deferred (later). state='stop' ends the audit "
+        "('Stop here') and returns a summary; the audit can be resumed with /airflow-audit."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "item": {"type": "string", "description": "Item number, e.g. '1.2'."},
+            "state": {
+                "type": "string",
+                "enum": [
+                    "fix_proposed",
+                    "sandbox_passed",
+                    "sandbox_failed",
+                    "applied",
+                    "retried",
+                    "verified",
+                    "skipped",
+                    "deferred",
+                    "stop",
+                ],
+            },
+            "note": {"type": "string", "description": "Optional short note."},
+        },
+        "required": ["state"],
+    },
+}
+
+AUDIT_TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
+    schema["name"]: schema
+    for schema in (AIRFLOW_AUDIT_PLAN, AIRFLOW_AUDIT_SELECT, AIRFLOW_AUDIT_PROGRESS)
+}

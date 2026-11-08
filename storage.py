@@ -19,9 +19,45 @@ from plugins.plugin_storage import plugin_db
 
 from .config import PLUGIN_NAME
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 _MIGRATIONS: dict[int, list[str]] = {
+    4: [
+        # Guided audits (plan v2): one dossier per audit, numbered items (1.1, 1.2, 2.1...).
+        """
+        CREATE TABLE IF NOT EXISTS audits (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at  REAL NOT NULL,
+            updated_at  REAL NOT NULL,
+            session_id  TEXT,
+            scope       TEXT NOT NULL,
+            period      TEXT NOT NULL,
+            status      TEXT NOT NULL,
+            candidates  TEXT NOT NULL,
+            pending     TEXT,
+            current     TEXT
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS audit_items (
+            audit_id   INTEGER NOT NULL,
+            number     TEXT NOT NULL,
+            dag_index  INTEGER NOT NULL,
+            position   INTEGER NOT NULL,
+            dag_id     TEXT NOT NULL,
+            run_id     TEXT,
+            task_id    TEXT,
+            category   TEXT NOT NULL,
+            kind       TEXT NOT NULL,
+            title      TEXT NOT NULL,
+            state      TEXT NOT NULL,
+            selected   INTEGER NOT NULL DEFAULT 0,
+            note       TEXT,
+            updated_at REAL NOT NULL,
+            PRIMARY KEY (audit_id, number)
+        )
+        """,
+    ],
     3: [
         # Retries performed by the plugin, per task instance (auto-retry limit and backoff).
         """

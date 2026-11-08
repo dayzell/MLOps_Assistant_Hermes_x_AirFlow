@@ -10,6 +10,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import shlex
+import shutil
 from pathlib import Path
 from typing import Any
 
@@ -545,3 +546,49 @@ def test_task_outcome_uses_the_announced_state(
     spec.loader.exec_module(module)
     assert module.task_final_state(output) == state
     assert module.task_passed(returncode, state) is passed
+
+
+# --------------------------------------------------------------------------- presenting the fix
+
+
+def test_result_shows_exact_location_and_a_ready_patch(dags: Path, api: Any) -> None:
+    """User request: easy-to-find file and lines, and an easy way to apply the tested fix."""
+    ctx = sandbox_ctx(dags)
+    ctx.dispatch_handler = lambda tool, args: terminal(sentinel(True))
+    result = ctx.call("airflow_sandbox_test", dag_id="train", patch=PATCH)
+    assert result["your_files_modified"] is False
+    change = result["changes"][0]
+    assert change["file"] == "train.py"
+    assert change["local_path"] == (dags / "train.py").resolve().as_posix()
+    block = change["blocks"][0]
+    # exact line, computed from the files although the LLM's hunk header said line 40
+    assert block["kind"] == "modified" and block["lines_before"] == [5, 5]
+    assert block["before"] == '   5 |     return frame["target"]'
+    assert block["after"] == '   5 |     return frame.get("target")'
+    patch_file = Path(result["patch_file"])
+    assert patch_file.is_file() and patch_file.suffix == ".patch"
+    assert dags.resolve() not in patch_file.resolve().parents  # never inside the user's repo
+    commands = result["apply_commands"]
+    assert commands["check"].startswith("git -C ") and "apply --check" in commands["check"]
+    assert commands["apply"].endswith(shlex.quote(patch_file.resolve().as_posix()))
+    # the saved patch is a clean diff that reproduces the tested change
+    copy = dags.parent / "verify"
+    shutil.copytree(dags, copy)
+    apply_unified_diff(copy, patch_file.read_text(encoding="utf-8"))
+    assert 'frame.get("target")' in (copy / "train.py").read_text(encoding="utf-8")
+    assert 'frame["target"]' in (dags / "train.py").read_text(encoding="utf-8")  # untouched
+
+
+def test_describe_changes_insert_and_crlf(tmp_path: Path) -> None:
+    from airflow_mlops.sandbox import describe_changes
+
+    src, copy = tmp_path / "src", tmp_path / "copy"
+    src.mkdir()
+    copy.mkdir()
+    (src / "d.py").write_bytes(b"a = 1\r\nb = 2\r\n")
+    (copy / "d.py").write_bytes(b"a = 1\r\nx = 9\r\nb = 2\r\n")
+    changes, patch = describe_changes(src, copy, ["d.py"])
+    block = changes[0]["blocks"][0]
+    assert block["kind"] == "added" and block["after_line"] == 1
+    assert block["after"] == "   2 | x = 9"
+    assert "+x = 9\r\n" in patch  # CRLF kept so `git apply` matches the real file

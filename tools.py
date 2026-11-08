@@ -17,6 +17,7 @@ from .airflow_client import AirflowError
 from .config import DagNotAllowedError, Settings
 from .dag_source import read_dag_source
 from .diagnosis import RunDiagnoser, load_rules
+from .display import FAIL
 from .guardrails import ClearRequest, ClearTasksAction, GuardrailError
 from .redaction import redact_text, redact_value
 from .reporting import ReportBuilder, parse_period, parse_scope
@@ -24,6 +25,7 @@ from .runtime import PluginRuntime
 from .sandbox import SandboxError, SandboxRequest, SandboxRunner
 from .textutils import excerpt_log, truncate_text, truncate_value
 from .views import build_dependency_view, collect_xcoms
+from .workflow import candidates_from_report, question_after_report
 
 logger = logging.getLogger(__name__)
 
@@ -349,6 +351,9 @@ class ReadTools:
             raise ToolInputError("'scope' and 'period' must be strings.")
         update_baseline = _optional_bool(args, "update_baseline")
         result = self._report(scope, period, True if update_baseline is None else update_baseline)
+        question = question_after_report(candidates_from_report(result["report"]))
+        if question:
+            result["next_question"] = question
         return ok(**result)
 
     def _report(self, scope: str, period: str | None, update_baseline: bool) -> dict[str, Any]:
@@ -369,9 +374,11 @@ class ReadTools:
         scope, period = parse_command_args(raw_args)
         result = json.loads(safe_handler(self.build_report)({"scope": scope, "period": period}))
         if result.get("ok"):
-            return str(result["markdown"])
-        err = result["error"]
-        return f"❌ /airflow-report : {err['message']} ({err['type']})"
+            text = str(result["markdown"])
+        else:
+            err = result["error"]
+            text = f"{FAIL} /airflow-report: {err['message']} ({err['type']})"
+        return text
 
 
 def parse_command_args(raw_args: str | None) -> tuple[str, str | None]:
@@ -391,6 +398,9 @@ class WriteTools:
 
     def __init__(self, runtime: PluginRuntime) -> None:
         self.runtime = runtime
+
+    # Set by register(): records a real retry in the guided audit (never raises).
+    observer: Callable[[str, list[str], dict[str, Any]], dict[str, Any] | None] | None = None
 
     def handlers(self) -> dict[str, Handler]:
         return {"airflow_clear_tasks": safe_handler(self.clear_tasks, context_aware=True)}
@@ -438,6 +448,10 @@ class WriteTools:
             session_id=_context_str(context, "session_id"),
             conversation_id=_context_str(context, "conversation_id"),
         )
+        if self.observer is not None:
+            audit = self.observer(dag_id, request.task_ids, result)
+            if audit:
+                result["audit"] = audit
         return ok(**result)
 
 
@@ -451,6 +465,9 @@ class SandboxTools:
 
     def __init__(self, runtime: PluginRuntime) -> None:
         self.runtime = runtime
+
+    # Set by register(): records the test on the guided audit's item (never raises).
+    observer: Callable[[str, str | None, str, dict[str, Any]], dict[str, Any] | None] | None = None
 
     def handlers(self) -> dict[str, Handler]:
         return {"airflow_sandbox_test": safe_handler(self.sandbox_test, context_aware=True)}
@@ -498,4 +515,10 @@ class SandboxTools:
             )
         finally:
             self.runtime.sandbox_lock.release()
+        if self.observer is not None:
+            audit = self.observer(
+                dag_id, task_id.strip() if isinstance(task_id, str) else None, level, result
+            )
+            if audit:
+                result["audit"] = audit
         return ok(**result)

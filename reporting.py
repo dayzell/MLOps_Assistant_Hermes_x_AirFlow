@@ -16,7 +16,8 @@ import json
 import logging
 import math
 import re
-from collections import defaultdict
+import unicodedata
+from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -24,6 +25,7 @@ from typing import Any
 from . import storage
 from .airflow_client import AirflowClient, AirflowError, parse_datetime
 from .config import DagNotAllowedError, Settings
+from .display import FAIL, NEXT, OK, SEVERITY_ICONS, STATUS_ICONS, WARN
 from .redaction import redact_value
 
 logger = logging.getLogger(__name__)
@@ -37,12 +39,12 @@ SECTION_KEYS = (
     "recommendations",
 )
 SECTION_TITLES = {
-    "scope_period": "1. Périmètre et période",
-    "health": "2. Santé globale",
-    "performance": "3. Performance par tâche",
-    "data_quality": "4. Qualité des données",
-    "incidents": "5. Incidents et actions",
-    "recommendations": "6. Recommandations",
+    "scope_period": "1. Scope and period",
+    "health": "2. Overall health",
+    "performance": "3. Performance per task",
+    "data_quality": "4. Data quality",
+    "incidents": "5. Incidents and actions",
+    "recommendations": "6. Recommendations",
 }
 
 DQ_FIELDS: dict[str, tuple[type, ...]] = {
@@ -630,9 +632,9 @@ class ReportBuilder:
                         "severity": "high" if rate < 0.8 else "medium",
                         "dag_id": dag["dag_id"],
                         "message": (
-                            f"{dag['failed']} run(s) en échec sur {dag['runs']} "
-                            f"(taux de succès {rate:.0%}) : lancer airflow_diagnose_run sur le "
-                            "dernier run en échec."
+                            f"{dag['dag_id']}: {dag['failed']} failed run(s) out of {dag['runs']} "
+                            f"(success rate {rate:.0%}). Run airflow_diagnose_run on the latest "
+                            "failed run."
                         ),
                     }
                 )
@@ -643,10 +645,9 @@ class ReportBuilder:
                     "severity": "high",
                     "dag_id": dag["dag_id"],
                     "message": (
-                        f"{dag['masked_failures']} run(s) de {dag['dag_id']} marqué(s) « success » "
-                        "contiennent des tâches en échec, masquées par la trigger_rule d'une tâche "
-                        "finale (ex. all_done) : lancer airflow_diagnose_run et revoir les "
-                        "trigger_rule."
+                        f"{dag['dag_id']}: {dag['masked_failures']} run(s) marked success contain "
+                        "failed tasks, hidden by the trigger_rule of a final task (e.g. all_done). "
+                        "Run airflow_diagnose_run and review the trigger rules."
                     ),
                 }
             )
@@ -659,8 +660,8 @@ class ReportBuilder:
                         "dag_id": task["dag_id"],
                         "task_id": task["task_id"],
                         "message": (
-                            f"Tâche {task['task_id']} {change:+.0%} plus lente que sa ligne de "
-                            "base (p50) : vérifier le volume de données et les ressources."
+                            f"Task {task['task_id']} is {change:+.0%} slower than its baseline "
+                            "(p50): check the data volume and the resources."
                         ),
                     }
                 )
@@ -671,8 +672,8 @@ class ReportBuilder:
                         "dag_id": task["dag_id"],
                         "task_id": task["task_id"],
                         "message": (
-                            f"Tâche {task['task_id']} instable : {task['retries']} retry(s) pour "
-                            f"{task['instances']} exécution(s) ; rechercher une cause transitoire."
+                            f"Task {task['task_id']} is flaky: {task['retries']} retry(ies) for "
+                            f"{task['instances']} run(s). Look for a transient cause."
                         ),
                     }
                 )
@@ -684,8 +685,8 @@ class ReportBuilder:
                         "dag_id": task["dag_id"],
                         "task_id": task["task_id"],
                         "message": (
-                            f"Attente en file p95 de {queue_p95:.0f}s pour {task['task_id']} : "
-                            "vérifier la taille des pools et la capacité des workers."
+                            f"Task {task['task_id']} waits {queue_p95:.0f}s in queue (p95): check "
+                            "the pool sizes and the worker capacity."
                         ),
                     }
                 )
@@ -694,14 +695,16 @@ class ReportBuilder:
             recs.append(
                 {
                     "severity": "medium",
-                    "message": f"{sla['miss_count']} dépassement(s) de SLA sur la période.",
+                    "message": f"{sla['miss_count']} SLA miss(es) in the period.",
                 }
             )
         elif not sla["configured"]:
             recs.append(
                 {
                     "severity": "info",
-                    "message": "Aucun seuil SLA configuré (sla_thresholds) : SLA non suivis.",
+                    "message": (
+                        "No SLA threshold configured (sla_thresholds): SLAs are not tracked."
+                    ),
                 }
             )
         quality = report["data_quality"]
@@ -710,8 +713,8 @@ class ReportBuilder:
                 {
                     "severity": "high",
                     "message": (
-                        f"{quality['failed_checks']} contrôle(s) qualité en échec : ne pas "
-                        "consommer les données concernées avant vérification."
+                        f"{quality['failed_checks']} data-quality check(s) failed: do not use the "
+                        "affected data before checking it."
                     ),
                 }
             )
@@ -721,10 +724,10 @@ class ReportBuilder:
                 {
                     "severity": "info",
                     "message": (
-                        "Qualité des données non instrumentée pour : "
+                        "Data quality not instrumented for: "
                         + ", ".join(missing[:10])
                         + (" ..." if len(missing) > 10 else "")
-                        + f" (publier l'XCom '{quality['convention_key']}')."
+                        + f" (publish the '{quality['convention_key']}' XCom)."
                     ),
                 }
             )
@@ -732,7 +735,7 @@ class ReportBuilder:
             recs.append(
                 {
                     "severity": "medium",
-                    "message": "Certains DAGs n'ont pas pu être lus : voir scope_period.errors.",
+                    "message": "Some DAGs could not be read: see scope_period.errors.",
                 }
             )
         if not any(r["severity"] in ("high", "medium", "low") for r in recs):
@@ -740,7 +743,7 @@ class ReportBuilder:
                 0,
                 {
                     "severity": "info",
-                    "message": "Aucune action requise : aucun incident ni dérive détectés.",
+                    "message": "No action required: no incident or drift detected.",
                 },
             )
         order = {"high": 0, "medium": 1, "low": 2, "info": 3}
@@ -763,16 +766,16 @@ def _dag_status(
                clean; healthy = no incident; no_data = no run in the period.
     """
     if not item.runs:
-        return "no_data", "aucun run sur la période"
+        return "no_data", "no run in the period"
     latest = item.runs[0]
     if latest.get("state") == "failed":
-        return "failing", "dernier run en échec"
+        return "failing", "latest run failed"
     if any(str(run["run_id"]) == str(latest.get("run_id")) for run in masked_runs):
-        return "failing", "échec masqué dans le dernier run, pourtant marqué success"
+        return "failing", "latest run marked success but a task failed"
     incidents = failed_runs + len(masked_runs)
     if incidents:
-        return "degraded", f"{incidents} incident(s) sur la période, dernier run sans échec"
-    return "healthy", "aucun incident"
+        return "degraded", f"{incidents} incident(s) in the period, latest run clean"
+    return "healthy", "no incident"
 
 
 def _global_status(per_dag: list[dict[str, Any]]) -> tuple[str, str, dict[str, int]]:
@@ -793,19 +796,19 @@ def _global_status(per_dag: list[dict[str, Any]]) -> tuple[str, str, dict[str, i
         return shown + (f", +{len(dags) - 5}" if len(dags) > 5 else "")
 
     if with_data == 0:
-        return "no_data", "aucun run sur la période", counts
+        return "no_data", "no run in the period", counts
     parts = []
     if failing:
-        parts.append(f"{len(failing)} DAG(s) sur {with_data} en échec : {names(failing)}")
+        parts.append(f"{len(failing)} of {with_data} DAG(s) failing: {names(failing)}")
     if degraded:
-        parts.append(f"{len(degraded)} DAG(s) dégradé(s) : {names(degraded)}")
+        parts.append(f"{len(degraded)} DAG(s) degraded: {names(degraded)}")
     if failing and len(failing) * 2 >= with_data:
         status = "failing"
     elif failing or degraded:
         status = "degraded"
     else:
-        return "healthy", f"aucun incident sur les {with_data} DAG(s) avec des runs", counts
-    return status, " ; ".join(parts), counts
+        return "healthy", f"no incident on the {with_data} DAG(s) with runs", counts
+    return status, "; ".join(parts), counts
 
 
 # ============================================================================ markdown
@@ -813,7 +816,7 @@ def _global_status(per_dag: list[dict[str, Any]]) -> tuple[str, str, dict[str, i
 
 def _fmt_s(value: float | None) -> str:
     if value is None:
-        return "—"
+        return "-"
     seconds = float(value)
     if seconds < 60:
         return f"{seconds:.1f}s"
@@ -825,11 +828,35 @@ def _fmt_s(value: float | None) -> str:
 
 
 def _fmt_rate(value: float | None) -> str:
-    return "—" if value is None else f"{value:.1%}"
+    return "-" if value is None else f"{value:.1%}"
 
 
 def _cell(value: Any) -> str:
     return str(value).replace("|", "\\|").replace("\n", " ")
+
+
+def _display_width(text: str) -> int:
+    """Columns taken in a terminal: emoji / wide characters count 2, combining marks 0."""
+    width = 0
+    for char in text:
+        if unicodedata.combining(char) or char == "\ufe0f":
+            continue
+        width += 2 if unicodedata.east_asian_width(char) in ("W", "F") else 1
+    return width
+
+
+def _table(headers: list[str], rows: list[list[Any]]) -> list[str]:
+    """Markdown table padded with spaces, so it stays aligned when shown as raw text
+    (slash-command output is not rendered as Markdown in the terminal)."""
+    grid = [[_cell(value) for value in row] for row in [headers, *rows]]
+    widths = [max(_display_width(row[i]) for row in grid) for i in range(len(headers))]
+
+    def line(row: list[str]) -> str:
+        cells = [c + " " * (widths[i] - _display_width(c)) for i, c in enumerate(row)]
+        return "| " + " | ".join(cells) + " |"
+
+    separator = "|" + "|".join("-" * (w + 2) for w in widths) + "|"
+    return [line(grid[0]), separator, *(line(row) for row in grid[1:])]
 
 
 def render_markdown(report: dict[str, Any]) -> str:
@@ -840,85 +867,96 @@ def render_markdown(report: dict[str, Any]) -> str:
     quality = report["data_quality"]
     incidents = report["incidents"]
     lines = [
-        f"# Rapport de monitoring Airflow — {scope['scope']} — {scope['period']}",
+        f"# Airflow monitoring report — {scope['scope']} — {scope['period']}",
         "",
         f"## {SECTION_TITLES['scope_period']}",
         "",
-        f"- Périmètre : `{scope['scope']}` ({scope['dag_count']} DAG(s))",
-        f"- Période : {scope['start']} → {scope['end']} ({scope['period']})",
-        f"- Généré le : {scope['generated_at']}",
+        f"- Scope: `{scope['scope']}` ({scope['dag_count']} DAG(s))",
+        f"- Period: {scope['start']} → {scope['end']} ({scope['period']})",
+        f"- Generated at: {scope['generated_at']}",
     ]
     if scope["dags_truncated"]:
-        lines.append(f"- ⚠️ Périmètre tronqué aux {scope['dag_count']} premiers DAGs")
+        lines.append(f"- {WARN} Scope limited to the first {scope['dag_count']} DAGs")
     if scope["sampled_dags"]:
-        lines.append(
-            f"- Échantillonné (runs récents uniquement) : {', '.join(scope['sampled_dags'])}"
-        )
+        lines.append(f"- Sampled (recent runs only): {', '.join(scope['sampled_dags'])}")
     for error in scope["errors"]:
-        lines.append(f"- ⚠️ {error['dag_id']} illisible : {error.get('message')}")
+        lines.append(f"- {WARN} {error['dag_id']} could not be read: {error.get('message')}")
 
+    counts = health["dag_status_counts"]
     lines += [
         "",
         f"## {SECTION_TITLES['health']}",
         "",
-        f"- Statut : **{health['status']}** — {health['status_reason']}",
-        f"- DAGs : {health['dag_status_counts']['healthy']} sain(s), "
-        f"{health['dag_status_counts']['degraded']} dégradé(s), "
-        f"{health['dag_status_counts']['failing']} en échec, "
-        f"{health['dag_status_counts']['no_data']} sans run",
-        f"- Runs : {health['total_runs']} (succès {health['success']}, échecs {health['failed']}, "
-        f"autres {health['other']})",
-        f"- Taux de succès : {_fmt_rate(health['success_rate'])}",
-        f"- Incidents : {health['incidents']} (dont {health['masked_failures']} échec(s) masqué(s) "
-        "dans des runs « success »)",
+        f"- Status: **{health['status']}** — {health['status_reason']}",
+        f"- DAGs: {counts['healthy']} healthy, {counts['degraded']} degraded, "
+        f"{counts['failing']} failing, {counts['no_data']} without runs",
+        f"- Runs: {health['total_runs']} (success {health['success']}, failed {health['failed']}, "
+        f"other {health['other']})",
+        f"- Success rate: {_fmt_rate(health['success_rate'])}",
+        f"- Incidents: {health['incidents']} (including {health['masked_failures']} masked "
+        "failure(s) in runs marked success)",
     ]
     if health["per_dag"]:
-        lines += [
-            "",
-            "| DAG | Statut | Runs | Succès | Échecs | Taux | Durée p50 | Durée p95 "
-            "| Dernier état |",
-            "|---|---|---|---|---|---|---|---|---|",
-        ]
-        icons = {"healthy": "✅", "degraded": "🟠", "failing": "🔴", "no_data": "—"}
-        for dag in health["per_dag"]:
-            status_cell = f"{icons[dag['status']]} {dag['status']}"
-            if dag["status"] in ("degraded", "failing"):
-                status_cell += f" ({_cell(dag['status_reason'])})"
-            lines.append(
-                f"| {_cell(dag['dag_id'])} | {status_cell} | {dag['runs']} | {dag['success']} "
-                f"| {dag['failed']} "
-                f"| {_fmt_rate(dag['success_rate'])} | {_fmt_s(dag['run_duration_p50_s'])} "
-                f"| {_fmt_s(dag['run_duration_p95_s'])} | {dag['last_run_state'] or '—'} |"
-            )
+        lines.append("")
+        lines += _table(
+            ["DAG", "Status", "Runs", "Success", "Failed", "Rate", "p50", "p95", "Last state"],
+            [
+                [
+                    dag["dag_id"],
+                    f"{STATUS_ICONS[dag['status']]} {dag['status']}",
+                    dag["runs"],
+                    dag["success"],
+                    dag["failed"],
+                    _fmt_rate(dag["success_rate"]),
+                    _fmt_s(dag["run_duration_p50_s"]),
+                    _fmt_s(dag["run_duration_p95_s"]),
+                    dag["last_run_state"] or "-",
+                ]
+                for dag in health["per_dag"]
+            ],
+        )
+        reasons = [d for d in health["per_dag"] if d["status"] in ("failing", "degraded")]
+        if reasons:
+            lines.append("")
+            lines += [
+                f"- {STATUS_ICONS[d['status']]} {d['dag_id']}: {d['status_reason']}"
+                for d in reasons
+            ]
 
     lines += ["", f"## {SECTION_TITLES['performance']}", ""]
     if perf["tasks"]:
-        lines += [
-            "| DAG | Tâche | p50 | p95 | Base p50 | Tendance | Retries | File p95 |",
-            "|---|---|---|---|---|---|---|---|",
-        ]
+        rows = []
         for task in perf["tasks"]:
             change = task["change_vs_baseline"]
             trend = task["trend"] + (f" ({change:+.0%})" if change is not None else "")
-            lines.append(
-                f"| {_cell(task['dag_id'])} | {_cell(task['task_id'])} "
-                f"| {_fmt_s(task['duration_p50_s'])} | {_fmt_s(task['duration_p95_s'])} "
-                f"| {_fmt_s(task['baseline_p50_s'])} | {trend} | {task['retries']} "
-                f"| {_fmt_s(task['queue_p95_s'])} |"
+            rows.append(
+                [
+                    task["dag_id"],
+                    task["task_id"],
+                    _fmt_s(task["duration_p50_s"]),
+                    _fmt_s(task["duration_p95_s"]),
+                    _fmt_s(task["baseline_p50_s"]),
+                    trend,
+                    task["retries"],
+                    _fmt_s(task["queue_p95_s"]),
+                ]
             )
+        lines += _table(
+            ["DAG", "Task", "p50", "p95", "Baseline p50", "Trend", "Retries", "Queue p95"], rows
+        )
         if perf["tasks_truncated"]:
-            lines.append(f"\n_Tableau limité aux {MAX_TASK_ROWS} tâches les plus longues (p95)._")
+            lines.append(f"\n_Table limited to the {MAX_TASK_ROWS} slowest tasks (p95)._")
     else:
-        lines.append("Aucune exécution de tâche sur la période.")
+        lines.append("No task run in the period.")
     sla = perf["sla"]
     if not sla["configured"]:
-        lines.append("\n- SLA : non configuré")
+        lines.append("\n- SLA: not configured")
     else:
-        lines.append(f"\n- SLA manqués : {sla['miss_count']}")
+        lines.append(f"\n- SLA misses: {sla['miss_count']}")
         for miss in sla["misses"][:10]:
             target = miss["dag_id"] + (f".{miss['task_id']}" if miss.get("task_id") else "")
             lines.append(
-                f"  - {target} ({miss['run_id']}) : {_fmt_s(miss['duration_s'])} > "
+                f"  - {target} ({miss['run_id']}): {_fmt_s(miss['duration_s'])} > "
                 f"{_fmt_s(miss['threshold_s'])}"
             )
 
@@ -926,27 +964,27 @@ def render_markdown(report: dict[str, Any]) -> str:
         "",
         f"## {SECTION_TITLES['data_quality']}",
         "",
-        f"Convention : XCom `{quality['convention_key']}` "
+        f"Convention: XCom `{quality['convention_key']}` "
         "(`rows`, `null_ratio`, `freshness`, `checks_passed`).",
         "",
     ]
     for dag in quality["per_dag"]:
         if dag["status"] == "instrumented":
             for check in dag["checks"]:
-                verdict = "✅" if check["checks_passed"] else "❌"
+                verdict = OK if check["checks_passed"] else FAIL
                 lines.append(
-                    f"- {verdict} {dag['dag_id']}.{check['task_id']} : {check['rows']} lignes, "
-                    f"nulls {check['null_ratio']:.1%}, fraîcheur {check['freshness']}"
+                    f"- {verdict} {dag['dag_id']}.{check['task_id']}: {check['rows']} rows, "
+                    f"nulls {check['null_ratio']:.1%}, freshness {check['freshness']}"
                 )
         elif dag["status"] == "non_conformant":
             problems = "; ".join(
                 f"{i['task_id']}: {', '.join(i['problems'])}" for i in dag["invalid"]
             )
-            lines.append(f"- ⚠️ {dag['dag_id']} : XCom non conforme ({problems})")
+            lines.append(f"- {WARN} {dag['dag_id']}: non-conformant XCom ({problems})")
         else:
-            lines.append(f"- {dag['dag_id']} : non instrumenté")
+            lines.append(f"- {dag['dag_id']}: not instrumented")
     if not quality["per_dag"]:
-        lines.append("- non instrumenté")
+        lines.append("- not instrumented")
 
     lines += [
         "",
@@ -958,41 +996,84 @@ def render_markdown(report: dict[str, Any]) -> str:
         tasks = ", ".join(run["failed_tasks"]) if run["failed_tasks"] else "?"
         diagnosis = run.get("diagnosis")
         diag = (
-            " — diagnostic : " + ", ".join(f"{k}={v}" for k, v in diagnosis.items())
+            " — diagnosis: " + ", ".join(f"{k}={v}" for k, v in diagnosis.items())
             if diagnosis
             else ""
         )
-        return f"  - {run['dag_id']} / {run['run_id']} : tâches en échec {tasks}{diag}"
+        return f"  - {run['dag_id']} / {run['run_id']}: failed tasks {tasks}{diag}"
 
     # Each run under its own heading: real failures first, then masked ones.
     shown = incidents["failed_runs"][:20]
-    lines.append(f"- Runs en échec : {incidents['failed_run_count']}")
+    lines.append(f"- Failed runs: {incidents['failed_run_count']}")
     lines += [run_line(r) for r in shown if not r.get("masked")]
     if incidents.get("masked_run_count"):
         lines.append(
-            f"- ⚠️ Runs marqués « success » qui masquent un échec : {incidents['masked_run_count']}"
+            f"- {WARN} Runs marked success that hide a failure: {incidents['masked_run_count']}"
         )
         lines += [run_line(r) for r in shown if r.get("masked")]
-    if incidents["actions"]:
-        lines.append(f"- Actions prises : {len(incidents['actions'])}")
-        for action in incidents["actions"][:20]:
-            if action["tool"] == "airflow_sandbox_test":
-                mode = "bac à sable"
-            elif action["dry_run"]:
-                mode = "aperçu"
-            else:
-                mode = "auto" if action["auto"] else "manuel"
-            target = " ".join(
-                part for part in (action["dag_id"], ", ".join(action["task_ids"])) if part
-            )
-            lines.append(
-                f"  - {action['ts']} {action['tool']} {target} ({mode}) → {action['outcome']}"
-            )
-    else:
-        lines.append("- Actions prises : aucune")
+    lines += _actions_summary(incidents["actions"])
 
     lines += ["", f"## {SECTION_TITLES['recommendations']}", ""]
-    labels = {"high": "🔴", "medium": "🟠", "low": "🟡", "info": "ℹ️"}
     for rec in report["recommendations"]:
-        lines.append(f"- {labels[rec['severity']]} {rec['message']}")
+        lines.append(f"- {SEVERITY_ICONS[rec['severity']]} {rec['message']}")
+    lines += _next_step(incidents)
     return "\n".join(lines) + "\n"
+
+
+MAX_ACTIONS_LISTED = 5
+
+
+def _action_mode(action: dict[str, Any]) -> str:
+    if action["tool"] == "airflow_sandbox_test":
+        return "sandbox"
+    if action["dry_run"]:
+        return "preview"
+    return "auto" if action["auto"] else "manual"
+
+
+def _actions_summary(actions: list[dict[str, Any]]) -> list[str]:
+    """Counts per kind of action, then only the latest real retries and a few others.
+
+    A real session produced 20 sandbox lines here: the counts say the same in one line.
+    """
+    if not actions:
+        return ["- Actions taken: none"]
+    sandbox = [a for a in actions if a["tool"] == "airflow_sandbox_test"]
+    clears = [a for a in actions if a["tool"] != "airflow_sandbox_test"]
+    parts = []
+    if sandbox:
+        outcomes = Counter(str(a["outcome"]) for a in sandbox)
+        detail = ", ".join(f"{name} {count}" for name, count in sorted(outcomes.items()))
+        parts.append(f"sandbox tests {len(sandbox)} ({detail})")
+    if clears:
+        previews = sum(1 for a in clears if a["dry_run"])
+        real = len(clears) - previews
+        parts.append(f"retries {real} executed, {previews} preview(s)")
+    lines = [f"- Actions taken: {len(actions)} — " + " · ".join(parts)]
+    # Real retries first (they changed Airflow), then the most recent other actions.
+    latest = [a for a in clears if not a["dry_run"]] + [
+        a for a in actions if a["tool"] == "airflow_sandbox_test" or a["dry_run"]
+    ]
+    for action in latest[:MAX_ACTIONS_LISTED]:
+        target = " ".join(
+            part for part in (action["dag_id"], ", ".join(action["task_ids"])) if part
+        )
+        lines.append(
+            f"  - {action['ts']} {action['tool']} {target} ({_action_mode(action)}) "
+            f"→ {action['outcome']}"
+        )
+    if len(actions) > MAX_ACTIONS_LISTED:
+        lines.append(f"  - … {len(actions) - MAX_ACTIONS_LISTED} older action(s) not listed")
+    return lines
+
+
+def _next_step(incidents: dict[str, Any]) -> list[str]:
+    """Closing line: the report is the state of play, the user picks what to diagnose."""
+    dags = list(dict.fromkeys(run["dag_id"] for run in incidents["failed_runs"]))
+    if not dags:
+        return []
+    return [
+        "",
+        f"{NEXT} **Next step**: tell me which DAG(s) to diagnose ({', '.join(dags)}), "
+        f'e.g. "diagnose {dags[0]}".',
+    ]

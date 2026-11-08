@@ -401,7 +401,7 @@ class RunDiagnoser:
 
         if not failed and not retrying:
             base.update(
-                status="no_failure",
+                outcome="no_failure",
                 summary={
                     "category": None,
                     "message": "No failed or retrying task instance in this run.",
@@ -457,7 +457,7 @@ class RunDiagnoser:
                 "real incident and review the trigger_rule of the final tasks."
             )
         base.update(
-            status="failed" if failed else "retrying",
+            outcome="failed" if failed else "retrying",
             summary={
                 "category": overall,
                 "root_failure_count": len(roots),

@@ -63,8 +63,34 @@ Vous parlez normalement ; l'agent choisit les bons outils.
 | « Montre-moi le log de la tâche `load` » | `airflow_get_task_logs` |
 | « Rapport de la semaine » ou `/airflow-report all 7d` | `airflow_build_report` |
 | « Relance la tâche en échec » | `airflow_clear_tasks` : aperçu d'abord, puis votre accord |
-| « Comment corriger cette erreur ? » | skill `airflow-fix-proposal`, qui propose un diff sans l'appliquer |
+| « Comment corriger cette erreur ? » | skill `airflow-fix-proposal` : le correctif (fichier, lignes, avant / après), puis l'offre de le tester dans le bac à sable |
+| « Applique le correctif » (après le test) | les outils de code habituels de Hermes ; ce n'est plus la procédure du plugin |
 | « Vérifie que ton correctif marche » | `airflow_sandbox_test`, qui le teste dans le bac à sable |
+| « Qu'est-ce qui est cassé ? Corrige mes DAGs » | un **plan numéroté par DAG** (1.1, 1.2, 2.1…), avec une correction proposée pour chaque problème ; l'agent demande ensuite par lequel commencer |
+
+**L'audit guidé : `/airflow-audit`** (une question à choix entre chaque étape)
+
+```
+/airflow-audit
+→ rapport, puis : Which DAG should I diagnose?   [demo_train_critical] [demo_fetch_transient] [All (2)] [Stop here]
+→ plan numéroté, puis : Which problem first?      [1.1 train — KeyError 'target'] [1.2 …] [All of DAG 1 (2)] [Stop here]
+→ correctif montré, puis : Test fix 1.1 in the sandbox?   [Test it] [Show the raw diff] [Skip the test] [Stop here]
+→ test réussi, puis : Apply it to your file?       [Apply it (your approval required)] [I'll apply it myself] [Not now] [Stop here]
+→ relance (aperçu d'abord), vérification, puis : What next?   [Continue with 1.2] [Next DAG …] [Stop here]
+```
+
+1. **État des lieux** : le rapport, puis le choix des DAGs à diagnostiquer. Rien n'est
+   diagnostiqué avant votre réponse.
+2. **Plan numéroté** (1.1, 1.2, 2.1…) : les numéros ne changent plus. Vous pouvez aussi taper
+   votre sélection : `1.1, 2.3`, `DAG 2`, `all critical`, `all except 2.1`.
+3. **Correctif, test, application, relance** : une question à chaque étape, l'option
+   recommandée en premier.
+4. **`Stop here`** à tout moment : un bilan s'affiche (fait, reste). `/airflow-audit` propose
+   ensuite de reprendre là où vous vous êtes arrêté ; `/airflow-status` montre où vous en êtes.
+
+Lancez Hermes avec `hermes chat -t airflow,file,terminal,clarify` : `clarify` affiche les
+questions sous forme de menu, `file` et `terminal` permettent à Hermes de modifier le code
+quand vous le lui demandez.
 
 **Commande rapide :** `/airflow-report [périmètre] [période]`
 
@@ -142,7 +168,7 @@ flowchart LR
 ### 5.2 Le rapport
 
 Toujours les **mêmes 6 sections, dans le même ordre**, pour pouvoir comparer d'une semaine à
-l'autre :
+l'autre. **Le rapport est en anglais**, et ses tableaux restent alignés même dans le terminal :
 
 1. **Périmètre et période** : quels DAGs, quelle fenêtre de temps.
 2. **Santé globale** : un **statut par DAG** (sain, dégradé, en échec), puis un statut global
@@ -152,7 +178,7 @@ l'autre :
 3. **Performance** : durée de chaque tâche comparée à sa durée habituelle, relances, attente,
    SLA.
 4. **Qualité des données** : lue depuis un XCom `data_quality` publié par vos DAGs (voir le
-   README). Sans cet XCom, la section affiche **« non instrumenté »** : jamais de chiffres
+   README). Sans cet XCom, la section affiche **« not instrumented »** : jamais de chiffres
    inventés.
 5. **Incidents et actions** : runs en échec et relances effectuées.
 6. **Recommandations** : classées par gravité.
@@ -195,9 +221,9 @@ apparaît dans la section 5 du rapport.
 
 ## 6. Le bac à sable
 
-**But :** avant de vous proposer un correctif, l'agent le **teste sur une maquette** dans un
-conteneur Docker jetable. Il vous présente ensuite une solution **qui a déjà fonctionné**, avec
-la preuve. Il n'applique toujours rien en production.
+**But :** une fois le correctif montré, l'agent vous **propose de le tester sur une maquette**
+dans un conteneur Docker jetable. Si vous acceptez, il vous rend le résultat avec la preuve,
+puis la procédure s'arrête : votre code n'a pas changé, et c'est vous qui décidez de la suite.
 
 ```mermaid
 flowchart LR
@@ -235,6 +261,11 @@ par défaut est `structure`.
   SSH… restent aux niveaux `import` et `structure`. La liste est réglable.
 - **Un seul test à la fois**, et au maximum 5 par session Hermes. C'est réglable.
 - **Votre code n'est jamais modifié** : le test travaille sur une copie, supprimée juste après.
+- **Une correction facile à retrouver** : l'agent indique le **chemin complet** du fichier et
+  les **lignes exactes** (avant / après), calculées par le bac à sable.
+- **La procédure s'arrête après le test.** Ensuite, c'est vous qui décidez : demander à
+  Hermes de modifier le fichier (ses outils de code habituels), ou lancer vous-même la
+  commande `git apply` fournie, avec sa commande d'annulation.
 - **Chaque test est journalisé** et apparaît dans le rapport (section 5).
 
 ### Pour que la tâche travaille sur un échantillon (niveau `task`)

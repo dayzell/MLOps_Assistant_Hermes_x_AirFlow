@@ -30,13 +30,13 @@ evidence-based reading. Reply in the user's language.
 - `airflow_build_report(scope="all" | "<dag_id>" | "tag:<tag>", period="24h" | "7d" | ...)`
   → `report` (JSON, six fixed keys) + `markdown` (fixed template).
 - Sections, in this exact order:
-  1. Périmètre et période — `scope_period`
-  2. Santé globale — `health` (per-DAG `status` + `status_reason`, global `status` +
+  1. Scope and period — `scope_period`
+  2. Overall health — `health` (per-DAG `status` + `status_reason`, global `status` +
      `status_reason` derived from the DAGs, runs, success rate, incidents)
-  3. Performance par tâche — `performance` (p50/p95, baseline, trend, retries, queue, SLA)
-  4. Qualité des données — `data_quality` (XCom convention `data_quality`)
-  5. Incidents et actions — `incidents` (failed runs, cached diagnosis, audit log actions)
-  6. Recommandations — `recommendations` (severity high/medium/low/info)
+  3. Performance per task — `performance` (p50/p95, baseline, trend, retries, queue, SLA)
+  4. Data quality — `data_quality` (XCom convention `data_quality`)
+  5. Incidents and actions — `incidents` (failed runs, cached diagnosis, audit log actions)
+  6. Recommendations — `recommendations` (severity high/medium/low/info)
 
 ## Procedure
 
@@ -47,17 +47,19 @@ evidence-based reading. Reply in the user's language.
    important recommendation. Never give a bare status: DAGs are independent, so say which
    ones are affected and which are healthy.
 3. Then output the tool's `markdown` **as is** (all six sections, same headings, same order).
-   Do not drop empty sections: an empty section still says "aucun" / "non configuré" /
-   "non instrumenté".
-4. If there are incidents, offer to triage the most recent one with the
-   `airflow-mlops:airflow-triage` skill (`airflow_diagnose_run`).
+   Do not drop empty sections: an empty section still says "none" / "not configured" /
+   "not instrumented".
+4. If there are incidents, end with the tool's `next_question` ("Which DAG should I
+   diagnose?"): call the `clarify` tool with exactly its question and choices, then do the
+   `then` of the chosen option (it starts the guided audit, `airflow-mlops:airflow-audit`).
+   Do not diagnose before the user has chosen.
 
 ## Writing rules
 
 - **Never invent a number.** Every figure must come from the tool output. Missing data is
-  written "—", "non configuré" or "non instrumenté", never estimated.
+  written "-", "not configured" or "not instrumented", never estimated.
 - Data quality comes only from the XCom convention (`rows`, `null_ratio`, `freshness`,
-  `checks_passed`). Without it, say "non instrumenté" and suggest instrumenting it.
+  `checks_passed`). Without it, say "not instrumented" and suggest instrumenting it.
 - Trends compare the p50 duration to the stored baseline: "no_baseline" on the first reports
   is normal (the baseline builds up over time).
 - SLA misses are only reported when `sla_thresholds` is configured.

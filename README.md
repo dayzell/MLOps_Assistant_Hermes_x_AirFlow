@@ -3,13 +3,18 @@
 Plugin **Hermes Agent** autonome qui transforme l'agent en assistant MLOps pour **Apache Airflow** :
 surveillance des DAGs, diagnostic de pannes, relance ciblée et protégée, rapports de monitoring normés.
 
-> **État : v0.6.1 — phases 1 à 5 livrées, validé sur Airflow 2.9.3 et 3.4.0**
+> **État : v0.8.0 — phases 1 à 5 livrées, validé sur Airflow 2.9.3 et 3.4.0**
 > - Fait : outils en lecture seule, redaction, diagnostic de panne avec classification
 >   transient / critical, rapports normés, commande `/airflow-report`, 3 skills, et
 >   remédiation protégée (relance ciblée, approbation humaine, politique de relance
 >   automatique, journal d'audit).
 > - Phase 5 : bac à sable Docker jetable pour tester un correctif avant de le proposer
 >   ([docs/phase5_sandbox_plan.md](docs/phase5_sandbox_plan.md)) — **v0.5.0**.
+
+> - **v2 en cours** : parcours guidé en questionnaire, dossier d'incident, verrou sur les DAGs.
+>   Ligne directrice : [docs/PLAN_V2_PARCOURS_GUIDE.md](docs/PLAN_V2_PARCOURS_GUIDE.md).
+>   Étapes 0 et 1 livrées : `/airflow-ui-check`, puis l'audit guidé (`/airflow-audit`,
+>   `/airflow-status`, outils `airflow_audit_*`, skill `airflow-audit`).
 
 📘 **Vue d'ensemble simple des fonctionnalités, des outils et des réglages :
 [docs/GUIDE_UTILISATEUR.md](docs/GUIDE_UTILISATEUR.md).** Ce README est la référence technique.
@@ -136,6 +141,13 @@ hermes -z "Utilise l'outil airflow_list_dags et liste mes DAGs Airflow." -t airf
 hermes chat -t airflow
 ```
 
+Pour que Hermes puisse ensuite **modifier le code** d'un DAG quand vous le lui demandez (après
+un correctif testé), ajoutez ses outils de fichiers, et le terminal pour `git apply` :
+
+```powershell
+hermes chat -t airflow,file,terminal
+```
+
 ### 3. Régler Ollama (une seule fois)
 
 Hermes fait aussi des **appels secondaires** au même modèle, par exemple pour générer le titre
@@ -260,6 +272,36 @@ n'exposent jamais de traceback.
 Types d'erreur : `invalid_argument`, `dag_not_allowed`, `config`, `auth`, `forbidden`,
 `not_found`, `bad_request`, `timeout`, `network`, `server`, `http`, `internal`.
 
+## Audit guidé (`/airflow-audit`, plan v2 étape 1)
+
+Le parcours complet, avec **une question à choix entre chaque étape** et `Stop here` toujours
+possible. C'est le plugin qui calcule les questions et leurs options (4 au maximum, la limite
+des menus de Hermes, l'option recommandée en premier) ; le modèle se contente de les afficher
+avec l'outil `clarify` de Hermes. Lancez Hermes avec `-t airflow,file,terminal,clarify`.
+
+1. **`/airflow-audit [périmètre] [période]`** : le rapport s'affiche, puis le menu
+   « Which DAG should I diagnose? » (le DAG le plus urgent est recommandé, puis `All (n)`,
+   `Stop here`). Le choix est transmis au modèle. Sans menu sur la surface utilisée, la
+   question s'affiche en liste numérotée.
+2. **`airflow_audit_plan(dag_ids)`** diagnostique les DAGs choisis et numérote les problèmes
+   (DAG 1 → 1.1, 1.2 ; ces numéros ne changent plus), puis demande « Which problem first? ».
+3. **`airflow_audit_select(selection)`** accepte aussi une sélection tapée : `1.1, 2.3`,
+   `1.1-1.3`, `DAG 2`, un nom de DAG, `all`, `all critical`, `all transient`,
+   `all except 2.1`. Elle est interprétée par le plugin, jamais par le modèle.
+4. **`airflow_audit_progress(item, state)`** enregistre chaque étape et renvoie la question
+   suivante : correctif montré → « Test fix 1.1 in the sandbox? » → « Apply it to your file? »
+   → « Retry the failed tasks? » → « What next? ». Le résultat du bac à sable et la vraie
+   relance sont enregistrés automatiquement. **Pas de relance tant qu'un autre problème du
+   même DAG reste à corriger** : le plugin affiche alors les problèmes restants (même DAG
+   d'abord, puis les autres DAGs), avec le même menu qu'après le diagnostic.
+5. **`Stop here`** (`state="stop"`) affiche un bilan (fait, reste, non diagnostiqué). Plus tard,
+   `/airflow-audit` sans argument propose `Resume (k left)`.
+
+**Le dossier d'incident** est gardé dans `plugin_db` (tables `audits` et `audit_items`). Avant
+chaque réponse du modèle, le hook `pre_llm_call` lui en rappelle un court résumé : un « yes »,
+un « 2 » ou « 1.2 » est donc toujours compris. `/airflow-status` affiche le plan numéroté et
+la ligne d'avancement (`[###----] 3/7 done · next: 1.2`).
+
 ## Diagnostic (`airflow_diagnose_run`)
 
 L'outil agrège en un seul appel les éléments nécessaires pour interpréter une panne.
@@ -325,6 +367,8 @@ mécanisme d'approbation de la phase 4 s'appuie sur ce cache.
 `airflow_build_report(scope, period)` produit un rapport **toujours dans la même structure**.
 Il renvoie un JSON (`report`, avec 6 clés fixes) et un Markdown (`markdown`, gabarit fixe).
 
+**Le rapport est rédigé en anglais**, quelle que soit la langue de la conversation. Ses sections s'intitulent `1. Scope and period`, `2. Overall health`, `3. Performance per task`, `4. Data quality`, `5. Incidents and actions` et `6. Recommendations`. Ses tableaux sont alignés avec des espaces pour rester lisibles dans le terminal : `/airflow-report` affiche le Markdown en texte brut. Les raisons de statut sont listées sous le tableau, et non dans les cellules. L'agent, lui, répond dans la langue de l'utilisateur.
+
 - `scope` : `all` (par défaut), un `dag_id` ou `tag:<tag>`. L'allowlist s'applique toujours.
 - `period` : un nombre suivi de `m`, `h`, `d` ou `w` (`24h`, `7d`…), au maximum 90 jours. Par
   défaut, `report_default_period`.
@@ -334,7 +378,7 @@ Il renvoie un JSON (`report`, avec 6 clés fixes) et un Markdown (`markdown`, ga
 | 1 | Périmètre et période | DAGs couverts, fenêtre UTC, DAGs échantillonnés ou illisibles |
 | 2 | Santé globale | **un statut par DAG** avec sa raison, et un statut global **expliqué** (voir ci-dessous), runs, taux de succès, incidents |
 | 3 | Performance par tâche | durées p50 / p95, ligne de base et tendance, retries, temps d'attente en file p50 / p95, SLA manqués |
-| 4 | Qualité des données | lue uniquement depuis la convention XCom ci-dessous ; sinon « non instrumenté » |
+| 4 | Qualité des données | lue uniquement depuis la convention XCom ci-dessous ; sinon « not instrumented » |
 | 5 | Incidents et actions | runs en échec, tâches en échec, diagnostic en cache, actions du journal d'audit |
 | 6 | Recommandations | règles simples (échecs, lenteur > +25 %, retries, file d'attente, SLA, qualité), triées par gravité |
 
@@ -376,9 +420,10 @@ Elles sont enregistrées via `ctx.register_skill` et accessibles sous le nom
 
 | Skill | Rôle |
 |---|---|
-| `airflow-triage` | Procédure de diagnostic : trouver la racine, lire logs / XComs / dépendances, classifier, proposer. Relancer le minimum, jamais le DAG entier, toujours un *dry run* d'abord. |
+| `airflow-triage` | Procédure de diagnostic : trouver la racine, lire logs / XComs / dépendances, classifier, proposer. Relancer le minimum, jamais le DAG entier, toujours un *dry run* d'abord. Avec **plusieurs problèmes**, l'agent présente d'abord un **plan numéroté par DAG** (1.1, 1.2, 2.1…), avec une correction proposée pour chacun, puis demande par lequel commencer. |
 | `airflow-report` | Présentation du rapport normé : résumé exécutif, puis les 6 sections inchangées. Aucun chiffre inventé. |
-| `airflow-fix-proposal` | Proposition de correctif pour une erreur critique : l'agent **lit le code** (`airflow_get_dag_source`), écrit le diff, le teste en bac à sable, puis indique les risques et la vérification. L'agent propose, il n'applique jamais de patch. |
+| `airflow-audit` | Le chef d'orchestre de l'audit guidé : rapport, choix, plan numéroté, correctif, test, application, relance, avec une question du plugin entre chaque étape. |
+| `airflow-fix-proposal` | Proposition de correctif pour une erreur critique : l'agent **lit le code** (`airflow_get_dag_source`), montre le correctif (fichier, lignes, avant / après, risques), **propose** de le tester en bac à sable, puis **s'arrête**. Les outils du plugin n'écrivent jamais vos fichiers ; si vous demandez ensuite la modification, Hermes la fait avec ses outils de code habituels, que la skill ne bride pas. |
 
 ## Remédiation protégée (`airflow_clear_tasks`)
 
@@ -484,7 +529,16 @@ avant qu'il soit proposé.
 - Chaque test est journalisé (`audit_log`).
 
 **Le résultat** est un JSON structuré : `passed`, `stages`, `exit_code`, `oom`, `timed_out`,
-`log_excerpt`, `patched_files`, `limits`.
+`log_excerpt`, `patched_files`, `limits`. Il contient aussi, pour présenter le correctif :
+
+- `changes` : pour chaque fichier, le **chemin complet** et les **lignes exactes**, avant et
+  après. Elles sont calculées à partir des fichiers, et non des numéros souvent faux écrits
+  par le modèle ;
+- `patch_file` : le correctif testé, enregistré comme **fichier `.patch` standard** dans
+  `plugin_data_dir`, jamais dans ton dépôt ;
+- `apply_commands` : les commandes `git apply --check`, `git apply` et `git apply -R`
+  (annulation) à lancer **après relecture** ;
+- `your_files_modified: false` : le rappel que seule une copie a été modifiée.
 
 **Prérequis** : Docker accessible au terminal **local** de Hermes, et une image
 `sandbox_image` contenant Airflow et les dépendances des DAGs. Le conteneur n'a pas de réseau,
@@ -508,7 +562,7 @@ suivante : la tâche de contrôle qualité pousse un XCom de clé `data_quality_
 | `freshness` | str (durée ISO 8601) ou nombre de secondes | Âge de la donnée la plus récente |
 | `checks_passed` | bool | Résultat global des contrôles |
 
-Sans XCom conforme, la section indique « non instrumenté » : le rapport n'invente jamais de
+Sans XCom conforme, la section indique « not instrumented » : le rapport n'invente jamais de
 chiffres. Exemple dans [demo-local-airflow/dags/mlops_demo.py](demo-local-airflow/dags/mlops_demo.py).
 
 ## Sécurité
@@ -558,7 +612,7 @@ Le projet a trois niveaux de vérification, du plus rapide au plus réaliste :
 | 3. Test Docker du bac à sable | `python demo-local-airflow/sandbox_smoke_test.py` | ~2–3 min | de vrais conteneurs Airflow |
 | 4. Test de bout en bout | `python demo-local-airflow/e2e_walkthrough.py` | ~1 min | un vrai serveur Airflow et ses vraies réponses |
 
-### 1. Tests unitaires (`pytest`, 330 tests)
+### 1. Tests unitaires (`pytest`, 416 tests)
 
 Ils simulent l'API Airflow avec `respx`, au format exact des versions **v1** (Airflow 2.x) et
 **v2** (Airflow 3.x). La plupart des tests tournent sur les deux versions. Les modules hôtes de
@@ -573,12 +627,15 @@ Docker n'est nécessaire.
 | [test_redaction.py](tests/test_redaction.py) | 32 | Masquage de chaque forme de secret, et le texte normal laissé intact |
 | [test_classification.py](tests/test_classification.py) | 33 | 22 erreurs réelles classées `transient` / `critical`, priorité du critique, OOM récurrent, règles personnalisées |
 | [test_diagnosis.py](tests/test_diagnosis.py) | 20 | Diagnostic de bout en bout : racine, échecs secondaires, tâches impactées, échecs masqués, XComs, cache |
-| [test_reporting.py](tests/test_reporting.py) | 56 | **Forme du rapport** (6 sections, toujours dans le même ordre), échecs masqués, calculs, ligne de base, SLA, qualité des données, commande `/airflow-report` |
+| [test_reporting.py](tests/test_reporting.py) | 64 | **Forme du rapport** (6 sections, toujours dans le même ordre), échecs masqués, calculs, ligne de base, SLA, qualité des données, section 5 résumée, commande `/airflow-report` |
 | [test_guardrails.py](tests/test_guardrails.py) | 47 | **Garde-fous** : aucune tâche réussie relancée, refus du DAG entier, `dry_run` par défaut, refus du critique, limite et backoff des relances automatiques, hook d'approbation, journal obligatoire |
 | [test_dag_source.py](tests/test_dag_source.py) | 18 | Lecture du code d'un DAG : API v1/v2, dossier local prioritaire, écart avec le code déployé, plages de lignes, masquage, et un diff construit à partir du code lu qui s'applique bien |
 | [test_sandbox.py](tests/test_sandbox.py) | 45 | Application des diffs, chemins interdits, commande Docker bridée, lecture des résultats (OOM, timeout, réseau), budget, nettoyage |
 | [test_storage.py](tests/test_storage.py) | 3 | Base SQLite : migrations et cache des diagnostics |
-| [test_skills.py](tests/test_skills.py) | 7 | Format des 3 skills, et outils cités qui existent bien |
+| [test_skills.py](tests/test_skills.py) | 10 | Format des 4 skills, et outils cités qui existent bien |
+| [test_workflow.py](tests/test_workflow.py) | 39 | **Audit guidé** : numérotation stable, sélection tapée (`1.1, 2.3`, `DAG 2`, `all critical`…), une question entre chaque étape (4 options au plus, recommandée en premier, `Stop here` en dernier), bilan, rappel du dossier |
+| [test_audit.py](tests/test_audit.py) | 28 | Audit guidé de bout en bout : outils `airflow_audit_*`, enregistrement automatique du bac à sable et de la relance, `/airflow-audit` (menu, repli en texte, `Stop here`, reprise), `/airflow-status`, hook `pre_llm_call` |
+| [test_ui_check.py](tests/test_ui_check.py) | 6 | `/airflow-ui-check` : chaque fonction de Hermes essayée, fonction absente ou refusée signalée |
 | [test_register.py](tests/test_register.py) | 7 | Manifest identique à ce que `register()` enregistre, aucun appel réseau au chargement, aucune lecture de `.env` |
 | [test_textutils.py](tests/test_textutils.py) | 6 | Extraction du bloc d'erreur et troncature |
 
@@ -586,6 +643,20 @@ Docker n'est nécessaire.
 .venv/Scripts/python -m pytest        # résumé
 .venv/Scripts/python -m pytest -v     # une ligne par test
 ```
+
+### Vérifier l'interface de Hermes (`/airflow-ui-check`)
+
+Dans une session Hermes, tapez `/airflow-ui-check`. La commande ne touche pas à Airflow ; elle
+essaie, sur la surface utilisée (terminal, Desktop, messagerie), les fonctions dont le parcours
+guidé a besoin, et affiche ✅, ⚠️ ou ❌ pour chacune :
+
+1. une barre d'avancement mise à jour sur place (`ctx.post_message`) ;
+2. une question à choix (`ctx.ask_choice`) ;
+3. l'envoi du choix au modèle (`ctx.inject_message`) : l'agent doit répondre
+   `ui-check received: ...`. Sur Desktop, il peut falloir
+   `plugins.entries.airflow-mlops.allow_gateway_injection: true` ;
+4. le contexte ajouté avant chaque réponse (hook `pre_llm_call`) : demandez ensuite
+   « What is the airflow ui-check code? », l'agent doit donner le code affiché.
 
 ### 2. Validation Hermes
 

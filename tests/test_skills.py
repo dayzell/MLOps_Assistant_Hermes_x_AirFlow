@@ -8,7 +8,7 @@ import pytest
 import yaml
 from harness import ROOT, make_context
 
-EXPECTED = ("airflow-triage", "airflow-report", "airflow-fix-proposal")
+EXPECTED = ("airflow-triage", "airflow-report", "airflow-fix-proposal", "airflow-audit")
 
 
 def _split(text: str) -> tuple[dict[str, object], str]:
@@ -52,7 +52,40 @@ def test_triage_skill_states_the_minimal_retry_rule() -> None:
     assert "dry_run=true" in body
 
 
-def test_fix_proposal_never_applies_patches() -> None:
+def test_fix_procedure_stops_after_the_sandbox_and_hands_over() -> None:
+    """User request: report -> pick -> fix -> offer the sandbox -> stop; Hermes' own code
+    tools then take over if the user wants the file changed (never blocked by the skill)."""
     body = (ROOT / "skills" / "airflow-fix-proposal" / "SKILL.md").read_text(encoding="utf-8")
-    assert "you do not apply" in body
-    assert "```diff" in body
+    assert "Offer the sandbox test and wait for the answer" in body
+    assert "This is where the procedure stops" in body
+    assert "this skill does not restrict them" in body
+    assert "even if a file or terminal tool is available" not in body
+    assert "apply_commands.check" in body  # applying it yourself stays possible
+    report = (ROOT / "skills" / "airflow-report" / "SKILL.md").read_text(encoding="utf-8")
+    assert "Do not diagnose before the user has chosen" in report
+
+
+def test_several_problems_are_presented_as_a_numbered_plan() -> None:
+    """User request: several bugs -> numbered plan grouped by DAG, then ask where to start."""
+    triage = (ROOT / "skills" / "airflow-triage" / "SKILL.md").read_text(encoding="utf-8")
+    assert "## Several problems at once" in triage
+    assert "1.1" in triage and "2.1" in triage
+    assert "Which one should I start with?" in triage
+    assert "Wait for the choice" in triage
+    fix = (ROOT / "skills" / "airflow-fix-proposal" / "SKILL.md").read_text(encoding="utf-8")
+    assert "numbered plan" in fix
+
+
+def test_fix_display_uses_exact_locations_and_apply_commands() -> None:
+    """User request: easy-to-find file/lines, a nice display, and the sandbox announced."""
+    fix = (ROOT / "skills" / "airflow-fix-proposal" / "SKILL.md").read_text(encoding="utf-8")
+    for needle in (
+        "changes[].local_path",
+        "block.before",
+        "block.after",
+        "apply_commands.apply",
+        "your_files_modified",
+    ):
+        assert needle in fix, needle
+    triage = (ROOT / "skills" / "airflow-triage" / "SKILL.md").read_text(encoding="utf-8")
+    assert "offer to test it in a disposable" in triage
