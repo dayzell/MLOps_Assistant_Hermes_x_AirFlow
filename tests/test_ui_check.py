@@ -1,4 +1,5 @@
-"""/airflow-ui-check: every Hermes UI feature is tried, a missing or refused one is reported."""
+"""/airflow-ui-check: every Hermes UI feature is tried, a missing or refused one is reported.
+Nothing is ever sent to the model behind the user's back."""
 
 from __future__ import annotations
 
@@ -20,11 +21,11 @@ class Handle:
 class HermesUi:
     """Stand-in for the Hermes context methods the probe uses."""
 
-    def __init__(self, answer: str | None = "demo_train_critical", inject_ok: bool = True) -> None:
+    def __init__(self, answer: str | None = "demo_train_critical") -> None:
         self.posted: list[str] = []
         self.questions: list[tuple[str, list[Any]]] = []
-        self.injected: list[tuple[str, dict[str, Any]]] = []
-        self.answer, self.inject_ok = answer, inject_ok
+        self.injected: list[str] = []
+        self.answer = answer
 
     def post_message(self, text: str) -> Handle:
         self.posted.append(text)
@@ -35,8 +36,8 @@ class HermesUi:
         return self.answer
 
     def inject_message(self, content: str, **kwargs: Any) -> bool:
-        self.injected.append((content, kwargs))
-        return self.inject_ok
+        self.injected.append(content)
+        return True
 
 
 def test_progress_bar() -> None:
@@ -53,32 +54,18 @@ def test_full_probe_on_a_capable_surface() -> None:
     question, choices = ui.questions[0]
     assert question.startswith("Which DAG should I diagnose?")
     assert len(choices) <= 4 and choices[-1]["value"] == STOP  # Hermes menus: 4 options max
-    content, kwargs = ui.injected[0]
-    assert "demo_train_critical" in content and kwargs == {"session_key": "k-1"}
-    for line in (
-        "1. Progress bar: ✅",
-        "2. Multiple-choice question: ✅",
-        "3. Answer sent to the model: ✅",
-    ):
-        assert line in text, line
+    assert ui.injected == []  # an injected turn would run unseen and could wait forever
+    assert "1. Progress bar: ✅" in text and "2. Multiple-choice question: ✅" in text
     # the code announced to the user is the one given to the model
     code = text.split("code ")[1].split(" ")[0]
     assert code in probe.pre_llm_call(session_id="s-1")["context"]
 
 
-def test_probe_reports_missing_or_refused_features() -> None:
+def test_probe_reports_missing_features() -> None:
     probe = UiCheck(object(), step_delay=0)  # an old Hermes: none of the methods exist
     text = probe.command("")
     assert "1. Progress bar: ❌ not available" in text
     assert "2. Multiple-choice question: ❌ not available" in text
-    refused = UiCheck(HermesUi(inject_ok=False), step_delay=0).command("")
-    assert "allow_gateway_injection" in refused
-
-
-def test_stop_here_sends_nothing_to_the_model() -> None:
-    ui = HermesUi(answer=STOP)
-    UiCheck(ui, step_delay=0).command("")
-    assert ui.injected == []
 
 
 def test_pre_llm_call_is_silent_without_a_probe() -> None:

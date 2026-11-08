@@ -272,9 +272,19 @@ def applied(audit: wf.Audit, *numbers: str) -> None:
         item.state = "applied"
 
 
-def test_no_retry_while_the_same_dag_has_a_fix_left() -> None:
-    audit = planned_audit()
-    applied(audit, "1.1")  # 1.2 (same DAG) is still to fix
+def two_crashes() -> wf.Audit:
+    """demo_train_critical with two tasks that crash (1.1 train, 1.2 load) + the masking 1.3."""
+    audit = wf.create_audit("all", "24h", [dict(c) for c in CANDIDATES], None)
+    diagnosis = critical_diagnosis()
+    diagnosis["root_failures"].append(root("load", "critical", "ValueError: bad schema"))
+    audit.items += wf.items_from_diagnosis(audit, diagnosis)
+    audit.items += wf.items_from_diagnosis(audit, transient_diagnosis())
+    return audit
+
+
+def test_no_retry_while_another_task_of_the_dag_crashes() -> None:
+    audit = two_crashes()
+    applied(audit, "1.1")  # 1.2 (load, same DAG) still crashes
     question = wf.next_step(audit, audit.item("1.1"), sandbox_enabled=True)["next_question"]
     check_question(question)
     assert question["question"] == (
@@ -282,13 +292,22 @@ def test_no_retry_while_the_same_dag_has_a_fix_left() -> None:
         "retry can work. Which one next?"
     )
     assert not any("retry" in c.lower() for c in question["choices"])
-    assert question["choices"][0].startswith("1.2 run")
+    assert question["choices"][0].startswith("1.2 load")
     assert question["options"][0]["description"] == (
         "recommended, same DAG: needed before the retry"
     )
-    assert question["choices"][1].startswith("2.1 fetch")  # the other DAG comes next
-    assert question["options"][1]["description"] == "DAG 2 — demo_fetch_transient"
     assert question["choices"][-1] == wf.STOP_LABEL
+
+
+def test_the_masking_trigger_rule_does_not_block_the_retry() -> None:
+    """User rule: only errors that make a task fail block the retry; 1.2 (all_done hiding the
+    failure) stays on the list."""
+    audit = planned_audit()
+    applied(audit, "1.1")  # 1.2 is the masking item, still to do
+    question = wf.next_step(audit, audit.item("1.1"), sandbox_enabled=True)["next_question"]
+    check_question(question)
+    assert question["choices"][0] == "Preview the retry of demo_train_critical (dry run)"
+    assert question["choices"][1].startswith("1.2 run")  # still offered, not blocking
 
 
 def test_retry_offered_once_the_dag_is_clean_with_the_other_problems() -> None:

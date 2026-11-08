@@ -421,7 +421,11 @@ AIRFLOW_AUDIT_PROGRESS: dict[str, Any] = {
     "parameters": {
         "type": "object",
         "properties": {
-            "item": {"type": "string", "description": "Item number, e.g. '1.2'."},
+            "item": {
+                "type": "string",
+                "description": "Item number, e.g. '1.2', or a group handled together, "
+                "e.g. '1.1, 1.2'.",
+            },
             "state": {
                 "type": "string",
                 "enum": [

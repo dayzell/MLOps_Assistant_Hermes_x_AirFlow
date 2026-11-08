@@ -1,7 +1,7 @@
 ---
 name: airflow-audit
 description: Run a guided Apache Airflow audit — state of play (report), then the user picks what to diagnose, then a numbered plan, a proposed fix, an optional sandbox test, the application and a targeted retry, with a multiple-choice question between every step and "Stop here" always possible. Use when the user runs /airflow-audit, asks to audit or check their Airflow, answers one of the audit questions, or an "[airflow-mlops audit ...]" reminder is in context.
-version: 0.8.0
+version: 0.9.0
 author: Joseph Keita
 license: MIT
 metadata:
@@ -21,7 +21,8 @@ plugin's own texts stay in English.
 ## When to Use
 
 - The user runs `/airflow-audit`, or asks "audit my Airflow", "what is broken?", "check my DAGs".
-- A message says "[airflow-mlops] In the audit menu the user chose: …".
+- The user sends a short message ("go") right after `/airflow-audit` printed
+  "ready. Send any message": do the pending step of the `[airflow-mlops audit …]` reminder.
 - An `[airflow-mlops audit #N …]` reminder is in your context and the user answers briefly
   ("yes", "go", "2", "1.2", "stop"): it refers to the audit's last question.
 
@@ -60,14 +61,23 @@ A result with `next_action` instead of a question: do that action now, then cont
 5. **Next.** When an item is closed the plugin asks "What next?" (continue, next DAG, stop).
 6. **Resume.** `airflow_audit_plan()` with no arguments returns the audit in progress.
 
+**Batches.** When the user picks several problems ("All of DAG 1", "all", "1.1, 2.1"):
+- fixes of the **same DAG** are handled together: read the code once, show each fix, report
+  them with one call (`item="1.1, 1.2"`), test them in **one** sandbox run with **one diff**
+  holding every fix, apply them with one approval of the file;
+- transient failures are retried together: one combined dry-run list, one decision;
+- the plugin keeps a progress message up to date in the conversation by itself: do not
+  rewrite it, just go on.
+
 Always show the progress line (`progress.line`, e.g. `[###----] 3/7 done · next: 1.2`)
 under each step.
 
 ## Pitfalls
 
 - Never diagnose, test, edit or retry anything the user did not choose.
-- Never retry a DAG that still has a problem to fix: the plugin then lists the problems left
-  (same DAG first) instead of offering the retry; do not offer it yourself.
+- Never retry a DAG while one of its tasks still crashes on a code error: the plugin then
+  lists the problems left (same DAG first) instead of offering the retry; do not offer it
+  yourself. The masking item (a final task's trigger_rule hiding the failure) does not block.
 - Never change a DAG file before its sandbox test passed **and** the user picked "Apply it";
   the approval prompt of the file tool is the final human validation.
 - Keep the plugin's numbers (1.1, 2.3…) for the whole audit; never renumber.

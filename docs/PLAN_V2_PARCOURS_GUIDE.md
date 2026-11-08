@@ -147,7 +147,7 @@ validation humaine. À noter dans le README.
 |---|---|
 | `ctx.ask_choice` | Questions depuis `/airflow-audit` |
 | outil `clarify` | Questions pendant la conversation (options venant de `next_question`) |
-| `ctx.inject_message` | Transmettre au modèle le choix fait dans une commande, avec son contexte |
+| ~~`ctx.inject_message`~~ | **Abandonné** (08/11/2026) : le tour lancé par le plugin s'exécute sans s'afficher et peut rester bloqué sur une question invisible. La commande enchaîne elle-même les étapes sans modèle ; l'utilisateur envoie « go » quand l'agent doit travailler |
 | `ctx.post_message` + `.edit()` | Barre d'avancement |
 | hook `pre_llm_call` | Résumé du dossier avant chaque réponse |
 | hooks `pre_tool_call` / `post_tool_call` | Verrou sur les DAGs, validations |
@@ -168,7 +168,7 @@ Arrêt pour validation après chaque étape (tests, ruff, mypy, `hermes plugins 
 |---|---|---|
 | **0. Prototypes** (livrée ; l'affichage est reporté à la fin) | Étiquettes `OK`/`FAIL`/`WARN` à la place des emoji dans les réponses ; commande `/airflow-ui-check` qui essaie `ask_choice`, la barre d'avancement, la couleur, `inject_message` et `pre_llm_call` | Ce qui marche dans Hermes Desktop et dans le terminal |
 | **1. Questionnaire et dossier** (livrée, v0.8.0) | Moteur de questions, table du dossier, `/airflow-audit`, `/airflow-status`, `pre_llm_call`, section 5 résumée, `next_question`, sélection tapée | Parcours complet sur la démo, `Stop here` puis reprise |
-| **2. Barre d'avancement et lots** | Message mis à jour, relances groupées, tests groupés par fichier | `All` sur plusieurs erreurs |
+| **2. Barre d'avancement et lots** (livrée, v0.9.0) | Message mis à jour, relances groupées, tests groupés par fichier | `All` sur plusieurs erreurs |
 | **3. Verrou sur les DAGs** | `pre_tool_call` / `post_tool_call` sur les outils de fichiers, `dag_write_guard`, question « Apply the fix? » | Écriture non testée bloquée, écriture testée validée |
 | **4. Skills** | `airflow-audit`, mise à jour des 3 skills, `airflow-dag-review` | Réponses de l'agent sur la démo |
 | **5. Cas métier** | `airflow-watch` (blueprint + alertes), `airflow-postmortem`, `docs/SCENARIO_DEMO.md` | Démo de bout en bout |

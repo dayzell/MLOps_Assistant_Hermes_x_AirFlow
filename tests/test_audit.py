@@ -159,15 +159,21 @@ def test_report_tool_offers_the_first_question(
 
 
 # ---------------------------------------------------------------------------- commands
+# The command runs the deterministic steps itself, menu after menu, and never sends a
+# message to the model: in Hermes v0.23 such a turn runs unseen and can wait forever on a
+# question nobody sees (real session: 10 minutes blocked). The user sends "go" when the
+# agent has work to do.
 
 
-def menu(ctx: FakeContext, answer: str | None, inject_ok: bool = True) -> dict[str, list[Any]]:
-    """Give the fake Hermes context the menu / message features of Hermes v0.23."""
-    seen: dict[str, list[Any]] = {"asked": [], "posted": [], "injected": []}
+def answers(ctx: FakeContext, *picks: str | None) -> dict[str, list[Any]]:
+    """Give the fake Hermes context menus (answered in order), post and inject."""
+    seen: dict[str, list[Any]] = {"asked": [], "choices": [], "posted": [], "injected": []}
+    queue = list(picks)
 
     def ask_choice(question: str, choices: list[Any]) -> str | None:
-        seen["asked"].append((question, choices))
-        return answer
+        seen["asked"].append(question)
+        seen["choices"].append([c["label"] for c in choices])
+        return queue.pop(0) if queue else None
 
     def post_message(text: str) -> Any:
         seen["posted"].append(text)
@@ -175,7 +181,7 @@ def menu(ctx: FakeContext, answer: str | None, inject_ok: bool = True) -> dict[s
 
     def inject_message(content: str, **kwargs: Any) -> bool:
         seen["injected"].append(content)
-        return inject_ok
+        return True
 
     ctx.ask_choice = ask_choice  # type: ignore[attr-defined]
     ctx.post_message = post_message  # type: ignore[attr-defined]
@@ -183,20 +189,28 @@ def menu(ctx: FakeContext, answer: str | None, inject_ok: bool = True) -> dict[s
     return seen
 
 
-def test_audit_command_report_menu_and_hand_over(
+def mock_etl_diagnosis(airflow: respx.MockRouter, api_version: str) -> None:
+    """What airflow_diagnose_run reads for the failed run e3 of 'etl' (see mock_airflow)."""
+    airflow.get("/dags/etl/dagRuns/e3").respond(json=p.dag_run(api_version, "etl", "e3", "failed"))
+    airflow.get("/dags/etl/tasks").respond(json=p.tasks(api_version))
+    airflow.get(path__regex=r"/dags/etl/dagRuns/e3/taskInstances/load/logs/\d+").respond(
+        json=p.log_body(api_version)
+    )
+
+
+def test_audit_command_report_menu_then_plan_in_the_command(
     api_version: str, airflow: respx.MockRouter, ctx: FakeContext
 ) -> None:
     mock_airflow(airflow, api_version)
-    seen = menu(ctx, "etl")
+    mock_etl_diagnosis(airflow, api_version)
+    seen = answers(ctx, "etl", "Stop here")
     text = ctx.commands["airflow-audit"]["handler"]("all 24h", session_id="s-1")
     assert seen["posted"][0].startswith("# Airflow monitoring report")  # shown before the menu
-    question, choices = seen["asked"][0]
-    assert question == "Which DAG should I diagnose?"
-    assert [c["label"] for c in choices] == ["etl", "Stop here"]
-    assert 'airflow_audit_plan with dag_ids=["etl"]' in seen["injected"][0]
-    assert text == "➡️ etl: starting."
-    # the model is reminded of the choice before its next reply
-    assert "Pending choice from a menu: etl" in hook_context(ctx)
+    assert seen["asked"] == ["Which DAG should I diagnose?", "Which problem first?"]
+    assert seen["choices"][0] == ["etl", "Stop here"]
+    assert "DAG 1 — etl" in text and "1.1 load" in text  # diagnosed by the command itself
+    assert "stopped" in text
+    assert seen["injected"] == []
 
 
 def test_audit_command_without_a_menu_falls_back_to_text(
@@ -213,32 +227,93 @@ def test_audit_command_stop_here(
     api_version: str, airflow: respx.MockRouter, ctx: FakeContext
 ) -> None:
     mock_airflow(airflow, api_version)
-    menu(ctx, "Stop here")
+    answers(ctx, "Stop here")
     text = ctx.commands["airflow-audit"]["handler"]("all 24h")
     assert "stopped" in text and "Not diagnosed: etl" in text
     assert hook_context(ctx) == ""  # a stopped audit is not pushed to the model
 
 
-def test_audit_command_when_injection_is_refused(
+def test_resume_then_pick_a_problem_and_type_go_once(
     api_version: str, airflow: respx.MockRouter, ctx: FakeContext
 ) -> None:
-    mock_airflow(airflow, api_version)
-    menu(ctx, "etl", inject_ok=False)
-    text = ctx.commands["airflow-audit"]["handler"]("all 24h")
-    assert text.startswith("Choice saved: etl. Send any message")
+    plan_train(airflow, api_version, ctx)
+    audit = wf.load_current()
+    assert audit is not None
+    label = audit.item("1.1").label()  # type: ignore[union-attr]
+    seen = answers(ctx, "Resume (1 left)", label)
+    text = ctx.commands["airflow-audit"]["handler"]("", platform="local", session_id="s-1")
+    assert seen["asked"][1] == "Which problem first?"  # second menu asked by the command
+    assert seen["injected"] == []
+    assert "DAG 1 — train" in text
+    assert text.rstrip().endswith(
+        f"➡️ {label}: ready. Send any message (e.g. 'go') and the agent continues from here."
+    )
+    pending = wf.load_current().pending  # type: ignore[union-attr]
+    assert pending is not None and "airflow_get_dag_source" in pending["then"]
+    assert "Pending choice from a menu" in hook_context(ctx)  # what "go" will mean
 
 
-def test_resume_and_status(api_version: str, airflow: respx.MockRouter, ctx: FakeContext) -> None:
+def test_a_step_for_the_agent_is_saved_not_sent(ctx: FakeContext) -> None:
+    """A retry preview needs the agent: saved as pending, the user sends 'go'."""
+    audit = wf.create_audit("all", "24h", [], "s-1")
+    audit.items += wf.items_from_diagnosis(
+        audit,
+        {
+            "dag_id": "fetch_dag",
+            "run_id": "r1",
+            "root_failures": [
+                {
+                    "task_id": "fetch",
+                    "classification": {"category": "transient", "matched_rules": []},
+                    "error_block": "ConnectionResetError: reset",
+                }
+            ],
+        },
+    )
+    wf.save_audit(audit)
+    item = audit.item("1.1")
+    assert item is not None and item.kind == "retry"
+    seen = answers(ctx, "Resume (1 left)", item.label(), "Preview the retry (dry run)")
+    text = ctx.commands["airflow-audit"]["handler"]("")
+    assert seen["injected"] == []
+    assert "Preview the retry (dry run): ready. Send any message" in text
+    pending = wf.load_current().pending  # type: ignore[union-attr]
+    assert pending is not None and "dry_run=true" in pending["then"]
+
+
+def test_status(api_version: str, airflow: respx.MockRouter, ctx: FakeContext) -> None:
     plan_train(airflow, api_version, ctx)
     status = ctx.commands["airflow-status"]["handler"]("")
     assert "[-------] 0/1 done · next: 1.1" in status and "DAG 1 — train" in status
-    seen = menu(ctx, "Resume (1 left)")
-    text = ctx.commands["airflow-audit"]["handler"]("")
-    assert seen["asked"][0][0].startswith("Resume audit #")
-    assert "airflow_audit_plan with no arguments" in seen["injected"][0]
-    assert text.endswith("➡️ Resume (1 left): starting.")
 
 
 def test_status_without_audit(ctx: FakeContext) -> None:
     text = ctx.commands["airflow-status"]["handler"]("")
     assert text == "No audit in progress. Start one with /airflow-audit."
+
+
+def test_desktop_and_terminal_behave_the_same(
+    api_version: str, airflow: respx.MockRouter, ctx: FakeContext
+) -> None:
+    mock_run(airflow, api_version, CRITICAL, logs={"transform": p.log_body(api_version)})
+    wf.create_audit(
+        "all",
+        "24h",
+        [
+            {
+                "dag_id": "train",
+                "status": "failing",
+                "reason": "latest run failed",
+                "run_id": "run_1",
+                "masked": False,
+                "category": "critical",
+                "incident": True,
+            }
+        ],
+        "s-1",
+    )
+    seen = answers(ctx, "Resume (1 left)", "train", "Stop here")
+    text = ctx.commands["airflow-audit"]["handler"]("", platform="desktop")
+    assert seen["asked"][1:] == ["Which DAG should I diagnose?", "Which problem first?"]
+    assert "DAG 1 — train" in text and "1.1 transform — critical" in text
+    assert "stopped" in text and seen["injected"] == []

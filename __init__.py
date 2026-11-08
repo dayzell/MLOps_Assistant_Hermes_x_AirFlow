@@ -83,6 +83,7 @@ def register(ctx: Any) -> None:
         )
     writes.observer = audits.observe_clear
     sandbox.observer = audits.observe_sandbox
+    sandbox.on_start = audits.observe_sandbox_start
 
     # Human approval for every real write unless the bounded auto-retry policy allows it,
     # and for sandbox tests above sandbox_max_level.
@@ -95,7 +96,7 @@ def register(ctx: Any) -> None:
         args_hint="[all|<dag_id>|tag:<tag>] [24h|7d]",
     )
 
-    commands = AuditCommands(ctx, tools)
+    commands = AuditCommands(ctx, tools, audits)
     ctx.register_command(
         "airflow-audit",
         commands.audit,

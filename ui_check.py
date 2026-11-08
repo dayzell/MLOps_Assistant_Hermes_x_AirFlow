@@ -4,8 +4,7 @@ It checks, on the surface the user is on (terminal, Desktop, messaging):
 
 1. ``ctx.post_message`` + ``edit``: a progress bar updated in place;
 2. ``ctx.ask_choice``: a multiple-choice question;
-3. ``ctx.inject_message``: the answer sent to the model as a message;
-4. the ``pre_llm_call`` hook: a code the model can only know through the injected context.
+3. the ``pre_llm_call`` hook: a code the model can only know through the added context.
 
 Every step is guarded: a missing or refused feature is reported, never raised. Nothing touches
 Airflow.
@@ -61,12 +60,11 @@ class UiCheck:
             "",
             f"1. Progress bar: {self._progress()}",
         ]
-        answer, asked = self._ask()
+        _, asked = self._ask()
         lines.append(f"2. Multiple-choice question: {asked}")
-        lines.append(f"3. Answer sent to the model: {self._inject(answer, kwargs)}")
         code = self._new_code()
         lines += [
-            f"4. Context before each reply (pre_llm_call): code {code} stored for 10 min.",
+            f"3. Context before each reply (pre_llm_call): code {code} stored for 10 min.",
             f'   -> Ask the agent: "What is the airflow ui-check code?" It should answer {code}.',
         ]
         return "\n".join(lines)
@@ -100,28 +98,6 @@ class UiCheck:
         if answer is None:
             return None, "⚠️ no answer (no picker on this surface, cancelled or timed out)"
         return str(answer), f"✅ you picked {answer!r}"
-
-    def _inject(self, answer: str | None, context: dict[str, Any]) -> str:
-        if answer is None or answer == STOP:
-            return "ℹ️ skipped (no DAG picked)"
-        inject = getattr(self._ctx, "inject_message", None)
-        if inject is None:
-            return "❌ not available in this Hermes version"
-        message = (
-            f"[airflow-mlops ui-check] The user picked {answer!r} in a menu. Do not call any "
-            f"tool; reply with exactly one line: 'ui-check received: {answer}'."
-        )
-        try:
-            key = context.get("session_key") or None
-            accepted = inject(message, session_key=key) if key else inject(message)
-        except Exception as exc:
-            return f"❌ {type(exc).__name__}: {exc}"
-        if accepted:
-            return "✅ queued: the agent should reply 'ui-check received: ...'"
-        return (
-            "❌ refused (Desktop / gateway: set "
-            "plugins.entries.airflow-mlops.allow_gateway_injection: true, then retry)"
-        )
 
     # ------------------------------------------------------------------ pre_llm_call
 

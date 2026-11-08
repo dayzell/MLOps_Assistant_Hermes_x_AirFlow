@@ -15,6 +15,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from . import storage
+from .display import FAIL, LATER, OK, PAUSE, WAITING, WORKING
 
 # Item states, in the order of the procedure.
 STATES = (
@@ -508,11 +509,26 @@ def _dag_selection(audit: Audit, dag_id: str) -> tuple[list[str], list[str]]:
 # ============================================================================ questions
 
 
-def option(label: str, then: str, description: str | None = None) -> dict[str, str]:
-    entry = {"label": label, "then": then}
+def option(
+    label: str,
+    then: str,
+    description: str | None = None,
+    *,
+    kind: str = "model",
+    value: str | None = None,
+) -> dict[str, str]:
+    """One choice: ``then`` is the instruction for the model; ``kind`` / ``value`` let the
+    slash command run the deterministic steps itself (plan, select, stop, resume)."""
+    entry = {"label": label, "then": then, "kind": kind}
     if description:
         entry["description"] = description
+    if value is not None:
+        entry["value"] = value
     return entry
+
+
+def stop_option() -> dict[str, str]:
+    return option(STOP_LABEL, STOP_THEN, kind="stop")
 
 
 def make_question(
@@ -538,32 +554,40 @@ def _plan_then(dag_ids: list[str]) -> str:
     return f"Call airflow_audit_plan with dag_ids={json.dumps(dag_ids)}."
 
 
+def _plan_option(label: str, dag_ids: list[str], description: str | None = None) -> dict[str, str]:
+    return option(label, _plan_then(dag_ids), description, kind="plan", value=",".join(dag_ids))
+
+
+def _select_option(label: str, selection: str, description: str | None = None) -> dict[str, str]:
+    return option(
+        label,
+        f'Call airflow_audit_select with selection="{selection}".',
+        description,
+        kind="select",
+        value=selection,
+    )
+
+
 def question_after_report(candidates: list[dict[str, Any]]) -> dict[str, Any] | None:
     """Which DAG should I diagnose? (None when nothing needs a diagnosis)."""
     if not candidates:
         return None
     ids = [c["dag_id"] for c in candidates]
     first = candidates[0]
-    options = [
-        option(
-            first["dag_id"],
-            _plan_then([first["dag_id"]]),
-            f"recommended: {_why(first)}",
-        )
-    ]
+    options = [_plan_option(first["dag_id"], [first["dag_id"]], f"recommended: {_why(first)}")]
     if len(candidates) == 2:
         second = candidates[1]
-        options.append(option(second["dag_id"], _plan_then([second["dag_id"]]), _why(second)))
+        options.append(_plan_option(second["dag_id"], [second["dag_id"]], _why(second)))
     elif len(candidates) > 2:
         critical = [c["dag_id"] for c in candidates if c["category"] == "critical" or c["masked"]]
         if 1 < len(critical) < len(candidates):
-            options.append(option(f"All critical ({len(critical)})", _plan_then(critical)))
+            options.append(_plan_option(f"All critical ({len(critical)})", critical))
         else:
             second = candidates[1]
-            options.append(option(second["dag_id"], _plan_then([second["dag_id"]]), _why(second)))
+            options.append(_plan_option(second["dag_id"], [second["dag_id"]], _why(second)))
     if len(candidates) > 1:
-        options.append(option(f"All ({len(candidates)})", _plan_then(ids)))
-    options.append(option(STOP_LABEL, STOP_THEN))
+        options.append(_plan_option(f"All ({len(candidates)})", ids))
+    options.append(stop_option())
     return make_question(
         "Which DAG should I diagnose?",
         options,
@@ -585,37 +609,66 @@ def question_after_plan(audit: Audit) -> dict[str, Any] | None:
     if not items:
         return None
     options = [
-        option(
+        _select_option(
             items[0].label(),
-            f'Call airflow_audit_select with selection="{items[0].number}".',
+            items[0].number,
             "recommended",
         )
     ]
     if len(items) > 1:
-        options.append(
-            option(
-                items[1].label(), f'Call airflow_audit_select with selection="{items[1].number}".'
-            )
-        )
+        options.append(_select_option(items[1].label(), items[1].number))
     first_dag = [i for i in items if i.dag_id == items[0].dag_id]
     if len(first_dag) > 1 and len(first_dag) < len(items):
         options.append(
-            option(
+            _select_option(
                 f"All of DAG {items[0].dag_index} ({len(first_dag)})",
-                f'Call airflow_audit_select with selection="DAG {items[0].dag_index}".',
+                f"DAG {items[0].dag_index}",
             )
         )
     elif len(items) > 2 or (len(items) == 2 and len(first_dag) == 2):
-        options.append(
-            option(f"All ({len(items)})", 'Call airflow_audit_select with selection="all".')
-        )
-    options.append(option(STOP_LABEL, STOP_THEN))
+        options.append(_select_option(f"All ({len(items)})", "all"))
+    options.append(stop_option())
     return make_question(
         "Which problem first?",
         options,
         typed="item numbers, e.g. '1.1, 2.3', '1.1-1.3', 'DAG 2', 'all critical', "
         "'all except 2.1' (then call airflow_audit_select with that text).",
     )
+
+
+def group_of(audit: Audit, item: Item) -> list[Item]:
+    """Selected code fixes of the same DAG at the same step: handled, tested and applied
+    together (one read of the code, one sandbox run, one approval for the file)."""
+    if item.kind == "retry" or not item.selected:
+        return [item]
+    members = [
+        i
+        for i in audit.ordered_items()
+        if i.selected
+        and i.is_open
+        and i.dag_id == item.dag_id
+        and i.kind != "retry"
+        and i.state == item.state
+    ]
+    return members if any(i.number == item.number for i in members) else [item]
+
+
+def retry_group(audit: Audit, item: Item) -> list[Item]:
+    """Selected transient failures ready to retry now (no fix left on their DAG)."""
+    if item.kind != "retry" or not item.selected:
+        return [item]
+    members = [
+        i
+        for i in audit.ordered_items()
+        if i.selected and i.kind == "retry" and i.state == "new" and not blocking_fixes(audit, i)
+    ]
+    return members if any(i.number == item.number for i in members) else [item]
+
+
+def _numbers(items: list[Item]) -> tuple[str, str]:
+    """``("1.1 + 1.2", "1.1, 1.2")``: the label shown, the value given to the tools."""
+    numbers = [i.number for i in items]
+    return " + ".join(numbers), ", ".join(numbers)
 
 
 def next_step(audit: Audit, item: Item | None, *, sandbox_enabled: bool) -> dict[str, Any]:
@@ -626,9 +679,12 @@ def next_step(audit: Audit, item: Item | None, *, sandbox_enabled: bool) -> dict
             if audit.open_items() or (audit.unplanned_candidates())
             else {"next_action": "Everything in this audit is handled. " + STOP_THEN}
         )
-    n, dag, run = item.number, item.dag_id, item.run_id
-    task = item.task_id
-    progress = f'airflow_audit_progress with item="{n}"'
+    dag, run, task = item.dag_id, item.run_id, item.task_id
+    group = group_of(audit, item)
+    many = len(group) > 1
+    n, values = _numbers(group)
+    fix = "Fixes" if many else "Fix"
+    progress = f'airflow_audit_progress with item="{values}"'
     if item.state == "new":
         blockers = blocking_fixes(audit, item)
         if item.kind == "retry" and blockers:
@@ -641,25 +697,15 @@ def next_step(audit: Audit, item: Item | None, *, sandbox_enabled: bool) -> dict
                 )
             }
         if item.kind == "retry":
+            return _retry_question(audit, item)
+        if many:
             return {
-                "next_question": make_question(
-                    f"{n}: {task} failed for a transient reason. Retry it?",
-                    [
-                        option(
-                            "Preview the retry (dry run)",
-                            f'Call airflow_clear_tasks with dag_id="{dag}", run_id="{run}", '
-                            f'task_ids=["{task}"], dry_run=true; show the list, then ask before '
-                            f'the real retry. After it, call {progress}, state="retried". '
-                            "In read-only mode, explain how to clear it in the Airflow UI.",
-                        ),
-                        option(
-                            "Diagnose deeper",
-                            f"Read the logs of {task} (airflow_get_task_logs) and explain; "
-                            "then ask this question again.",
-                        ),
-                        option("Skip it", f'Call {progress}, state="skipped".'),
-                        option(STOP_LABEL, STOP_THEN),
-                    ],
+                "next_action": (
+                    f"Fixes {n} are in the same DAG {dag}: read the code once with "
+                    f'airflow_get_dag_source(dag_id="{dag}"), present each fix with the '
+                    "airflow-fix-proposal template (step A), then call "
+                    f'{progress}, state="fix_proposed". They are tested together in one '
+                    "sandbox run. Do not edit any file."
                 )
             }
         return {
@@ -674,21 +720,22 @@ def next_step(audit: Audit, item: Item | None, *, sandbox_enabled: bool) -> dict
         if not sandbox_enabled:
             return {
                 "next_question": make_question(
-                    f"Fix {n} cannot be tested here (sandbox disabled). What now?",
+                    f"{fix} {n} cannot be tested here (sandbox disabled). What now?",
                     [
                         option("Show the raw diff", "Show the unified diff, then ask again."),
                         option("Keep it for later", f'Call {progress}, state="deferred".'),
-                        option(STOP_LABEL, STOP_THEN),
+                        stop_option(),
                     ],
                 )
             }
+        diff = "ONE diff containing every fix" if many else "the diff"
         return {
             "next_question": make_question(
-                f"Test fix {n} in the sandbox?",
+                f"Test {fix.lower()} {n} in the sandbox{' (one run)' if many else ''}?",
                 [
                     option(
-                        "Test it (copy, no network)",
-                        f'Call airflow_sandbox_test with dag_id="{dag}", the diff, '
+                        "Test it (copy, no network)" if not many else "Test them (one run)",
+                        f'Call airflow_sandbox_test once with dag_id="{dag}", {diff}, '
                         'level="import", then level="structure"'
                         + (f' with task_id="{task}"' if task else "")
                         + ". The plugin records the result in the audit.",
@@ -696,35 +743,36 @@ def next_step(audit: Audit, item: Item | None, *, sandbox_enabled: bool) -> dict
                     ),
                     option("Show the raw diff", "Show the unified diff, then ask this again."),
                     option("Skip the test", f'Call {progress}, state="deferred".'),
-                    option(STOP_LABEL, STOP_THEN),
+                    stop_option(),
                 ],
             )
         }
     if item.state == "sandbox_passed":
+        it = "them" if many else "it"
         return {
             "next_question": make_question(
-                f"Fix {n} passed the sandbox test. Apply it to your file?",
+                f"{fix} {n} passed the sandbox test. Apply {it} to your file?",
                 [
                     option(
-                        "Apply it (your approval required)",
+                        f"Apply {it} (your approval required)",
                         "Edit the file with your file tools exactly as tested (sandbox result: "
                         "changes / patch_file), read it back and show the changed lines; then "
                         f'call {progress}, state="applied".',
                     ),
                     option(
-                        "I'll apply it myself",
+                        f"I'll apply {it} myself",
                         "Show apply_commands (check, apply, undo) from the sandbox result; "
                         f'call {progress}, state="applied" once the user confirms.',
                     ),
                     option("Not now", f'Call {progress}, state="deferred".'),
-                    option(STOP_LABEL, STOP_THEN),
+                    stop_option(),
                 ],
             )
         }
     if item.state == "sandbox_failed":
         return {
             "next_question": make_question(
-                f"The sandbox test of fix {n} failed.",
+                f"The sandbox test of {fix.lower()} {n} failed.",
                 [
                     option(
                         "Revise the fix",
@@ -732,39 +780,41 @@ def next_step(audit: Audit, item: Item | None, *, sandbox_enabled: bool) -> dict
                     ),
                     option("Show the sandbox log", "Show log_excerpt, then ask this again."),
                     option("Keep it for later", f'Call {progress}, state="deferred".'),
-                    option(STOP_LABEL, STOP_THEN),
+                    stop_option(),
                 ],
             )
         }
     if item.state == "applied":
-        blockers = blocking_fixes(audit, item)
+        done = {i.number for i in group}
+        blockers = [b for b in blocking_fixes(audit, item) if b.number not in done]
+        verb = "are" if many else "is"
         if blockers:
             return {
                 "next_question": question_remaining(
                     audit,
-                    f"Fix {n} is applied, but {dag} still has {len(blockers)} problem(s) to fix "
-                    "before a retry can work. Which one next?",
+                    f"{fix} {n} {verb} applied, but {dag} still has {len(blockers)} problem(s) "
+                    "to fix before a retry can work. Which one next?",
                     ref=item,
                 )
             }
         retry = retry_option(audit, dag, run, recommended=True)
-        if remaining(audit, exclude=n):
+        if [i for i in remaining(audit) if i.number not in done]:
             return {
                 "next_question": question_remaining(
                     audit,
-                    f"Fix {n} is applied and {dag} has nothing left to fix. Retry it now, or "
-                    "handle another problem first?",
+                    f"{fix} {n} {verb} applied and {dag} has nothing left to fix. Retry it now, "
+                    "or handle another problem first?",
                     lead=[retry],
                     ref=item,
                 )
             }
         return {
             "next_question": make_question(
-                f"Fix {n} is applied. Retry the failed tasks of {dag}?",
+                f"{fix} {n} {verb} applied. Retry the failed tasks of {dag}?",
                 [
                     retry,
                     option("Not now", f'Call {progress}, state="deferred".'),
-                    option(STOP_LABEL, STOP_THEN),
+                    stop_option(),
                 ],
             )
         }
@@ -778,6 +828,58 @@ def next_step(audit: Audit, item: Item | None, *, sandbox_enabled: bool) -> dict
             )
         }
     return {"next_question": question_what_next(audit)}
+
+
+def _retry_question(audit: Audit, item: Item) -> dict[str, Any]:
+    """One question for every selected transient failure: one preview, one decision."""
+    group = retry_group(audit, item)
+    n, values = _numbers(group)
+    progress = f'airflow_audit_progress with item="{values}"'
+    if len(group) == 1:
+        dag, run, task = item.dag_id, item.run_id, item.task_id
+        return {
+            "next_question": make_question(
+                f"{n}: {task} failed for a transient reason. Retry it?",
+                [
+                    option(
+                        "Preview the retry (dry run)",
+                        f'Call airflow_clear_tasks with dag_id="{dag}", run_id="{run}", '
+                        f'task_ids=["{task}"], dry_run=true; show the list, then ask before '
+                        "the real retry (the plugin records it). In read-only mode, explain "
+                        "how to clear it in the Airflow UI.",
+                    ),
+                    option(
+                        "Diagnose deeper",
+                        f"Read the logs of {task} (airflow_get_task_logs) and explain; "
+                        "then ask this question again.",
+                    ),
+                    option("Skip it", f'Call {progress}, state="skipped".'),
+                    stop_option(),
+                ],
+            )
+        }
+    calls = "; ".join(
+        f'dag_id="{i.dag_id}", run_id="{i.run_id}", task_ids=["{i.task_id}"]' for i in group
+    )
+    return {
+        "next_question": make_question(
+            f"Retry the {len(group)} transient failures ({n})?",
+            [
+                option(
+                    "Preview all retries (dry run)",
+                    f"Call airflow_clear_tasks with dry_run=true for each: {calls}. Show ONE "
+                    "combined list, then ask once (clarify) before the real retries; each real "
+                    "call goes through Hermes' approval. The plugin records them.",
+                ),
+                _select_option(
+                    "One by one",
+                    group[0].number,
+                ),
+                option("Skip them", f'Call {progress}, state="skipped".'),
+                stop_option(),
+            ],
+        )
+    }
 
 
 def question_what_next(audit: Audit) -> dict[str, Any]:
@@ -798,11 +900,13 @@ def remaining(audit: Audit, exclude: str | None = None) -> list[Item]:
 
 
 def blocking_fixes(audit: Audit, item: Item) -> list[Item]:
-    """Code fixes left on the same DAG: retrying it before they are applied fails again."""
+    """Code errors left on the same DAG that make a task fail: a retry before they are fixed
+    fails again. The masking item (a final task's trigger_rule hiding the failure, no
+    ``task_id``) does not block: the DAG runs fine without that fix, it stays on the list."""
     return [
         i
         for i in remaining(audit, exclude=item.number)
-        if i.dag_id == item.dag_id and i.kind != "retry"
+        if i.dag_id == item.dag_id and i.kind != "retry" and i.task_id is not None
     ]
 
 
@@ -841,28 +945,26 @@ def question_remaining(
             where = f"DAG {entry.dag_index} — {entry.dag_id}"
         recommended = not lead and index == 0
         options.append(
-            option(
+            _select_option(
                 entry.label(),
-                f'Call airflow_audit_select with selection="{entry.number}".',
+                entry.number,
                 f"recommended, {where}" if recommended else where,
             )
         )
     if len(pool) > len(shown):
-        options.append(
-            option(
-                f"All remaining ({len(pool)})", 'Call airflow_audit_select with selection="all".'
-            )
-        )
+        options.append(_select_option(f"All remaining ({len(pool)})", "all"))
     unplanned = audit.unplanned_candidates()
     if unplanned and len(options) < MAX_CHOICES - 1:
         options.append(
             option(
                 f"Diagnose {unplanned[0]['dag_id']}",
                 _plan_then([unplanned[0]["dag_id"]]),
-                _why(unplanned[0]),
+                kind="plan",
+                value=unplanned[0]["dag_id"],
+                description=_why(unplanned[0]),
             )
         )
-    options.append(option(STOP_LABEL, STOP_THEN))
+    options.append(stop_option())
     return make_question(
         text,
         options,
@@ -873,10 +975,43 @@ def question_remaining(
 # ============================================================================ summaries
 
 
+STATE_TEXT = {
+    "new": "to do",
+    "fix_proposed": "fix proposed",
+    "sandbox_passed": "sandbox passed",
+    "sandbox_failed": "sandbox failed",
+    "applied": "applied to the file",
+    "retried": "retried, checking the run",
+    "verified": "verified",
+    "skipped": "skipped",
+    "deferred": "kept for later",
+}
+
+
+def board_text(audit: Audit, activity: str) -> str:
+    """The live progress board of the batch being handled (the selected items)."""
+    items = [i for i in audit.ordered_items() if i.selected] or audit.ordered_items()
+    done = sum(1 for i in items if i.state in CLOSED_STATES)
+    lines = [f"Audit #{audit.id} {progress_line(done, len(items))} · {activity}"]
+    for item in items:
+        if item.state in CLOSED_STATES:
+            icon = OK
+        elif item.state == "sandbox_failed":
+            icon = FAIL
+        elif item.number == audit.current:
+            icon = WORKING
+        elif item.state == "deferred":
+            icon = LATER
+        else:
+            icon = WAITING
+        lines.append(f"  {icon} {item.label()} — {STATE_TEXT[item.state]}")
+    return "\n".join(lines)
+
+
 def stop_summary(audit: Audit) -> str:
     done = [i for i in audit.ordered_items() if i.state in CLOSED_STATES]
     left = [i for i in audit.ordered_items() if i.state not in CLOSED_STATES]
-    lines = [f"⏸ Audit #{audit.id} stopped. {audit.progress()['line']}"]
+    lines = [f"{PAUSE} Audit #{audit.id} stopped. {audit.progress()['line']}"]
     if done:
         lines.append("Done: " + ", ".join(f"{i.number} ({i.state})" for i in done))
     if left:

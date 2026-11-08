@@ -468,6 +468,7 @@ class SandboxTools:
 
     # Set by register(): records the test on the guided audit's item (never raises).
     observer: Callable[[str, str | None, str, dict[str, Any]], dict[str, Any] | None] | None = None
+    on_start: Callable[[str, str | None, str], None] | None = None
 
     def handlers(self) -> dict[str, Handler]:
         return {"airflow_sandbox_test": safe_handler(self.sandbox_test, context_aware=True)}
@@ -496,6 +497,8 @@ class SandboxTools:
         _check_allowed(settings, dag_id)
         if not self.runtime.sandbox_lock.acquire(blocking=False):
             raise SandboxError("Another sandbox test is already running; wait for it to finish.")
+        if self.on_start is not None:
+            self.on_start(dag_id, task_id.strip() if isinstance(task_id, str) else None, level)
         try:
             runner = SandboxRunner(
                 self.runtime.client(settings),
