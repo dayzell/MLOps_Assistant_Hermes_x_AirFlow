@@ -33,6 +33,7 @@ from plugins.plugin_storage import plugin_data_dir
 from . import storage
 from .airflow_client import AirflowClient, AirflowError
 from .config import PLUGIN_NAME, SANDBOX_LEVELS, Settings
+from .dag_guard import record_tested
 from .redaction import redact_text
 from .textutils import excerpt_log
 from .views import collect_xcoms
@@ -544,6 +545,8 @@ class SandboxRunner:
         self.dispatch = dispatch
         self.session_id = session_id
         self.conversation_id = conversation_id
+        self.tested_files: list[tuple[Path, bytes | None, bytes]] = []
+        self.tested_patch = ""
 
     def run(self, request: SandboxRequest) -> dict[str, Any]:
         try:
@@ -555,6 +558,11 @@ class SandboxRunner:
             self._journal(request, "error", exc.to_dict())
             raise
         outcome = "passed" if result.get("passed") else "failed"
+        if result.get("passed") and self.tested_files:
+            try:  # the lock lets this exact change (and only it) be applied, after approval
+                record_tested(request.dag_id, request.level, self.tested_patch, self.tested_files)
+            except Exception:
+                logger.warning("airflow-mlops: could not record the tested change", exc_info=True)
         result["audit_id"] = self._journal(
             request,
             outcome,
@@ -617,6 +625,16 @@ class SandboxRunner:
             patched = apply_unified_diff(dags_copy, request.patch)
             changes, clean_patch = describe_changes(dags_path, dags_copy, patched)
             patch_file = save_patch(clean_patch, request.dag_id)
+            # For the DAG write lock: the exact content before / after, read before cleanup.
+            self.tested_files = [
+                (
+                    dags_path / rel,
+                    (dags_path / rel).read_bytes() if (dags_path / rel).is_file() else None,
+                    (dags_copy / rel).read_bytes(),
+                )
+                for rel in patched
+            ]
+            self.tested_patch = str(patch_file)
             shutil.copy2(RUNNER_SOURCE, workspace / "check_dag.py")
             expected = {str(t["task_id"]): list(t.get("downstream_task_ids") or []) for t in tasks}
             (workspace / "expected_structure.json").write_text(json.dumps(expected), "utf-8")

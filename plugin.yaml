@@ -1,5 +1,5 @@
 name: airflow-mlops
-version: 0.9.0
+version: 0.10.0
 description: Apache Airflow MLOps assistant — monitor DAGs, diagnose failed runs, targeted retries and standard reports
 author: Joseph Keita
 manifest_version: 2
@@ -32,6 +32,7 @@ provides_tools:
 provides_hooks:
   - pre_tool_call
   - pre_llm_call
+  - post_tool_call
 
 # Only one credential set is needed: AIRFLOW_TOKEN (auth_mode: token) or
 # AIRFLOW_USERNAME + AIRFLOW_PASSWORD (auth_mode: basic or jwt).
@@ -186,3 +187,7 @@ config_schema:
     type: int
     default: 5
     description: Maximum number of sandbox tests per Hermes session.
+  dag_write_guard:
+    type: str
+    default: sandbox_required
+    description: "Lock on the files of sandbox_dags_path: sandbox_required (only the exact change that passed the sandbox, after a human approval), approval_only (a human approves every write), off."

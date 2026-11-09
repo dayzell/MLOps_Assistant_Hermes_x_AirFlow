@@ -109,9 +109,13 @@ here; your file is unchanged." and the same "Next" list without the commands.
 
 ## If the user then asks you to apply the fix
 
-This is ordinary code editing, outside the procedure: use your file tools as usual.
-- Apply exactly the tested change, at the location given by `changes` (or the patch file);
-  if the file changed since the test, read it again first.
+This is ordinary code editing, outside the procedure, with one rule: the airflow-mlops
+**lock on DAG files** lets through only the exact change that passed the sandbox, and Hermes
+asks the user to approve it.
+- Best way: run `apply_commands.apply` of the sandbox result (`git apply` of the tested patch)
+  with the terminal tool. A `write_file` / `patch` producing exactly the tested file also
+  passes; anything else is blocked, and the message says what to do (usually: test again).
+- If the file changed since the test, test the fix again on the current file.
 - Read the file back and show the changed lines.
 - Do not commit, push or deploy unless asked; never change Airflow Connections or Variables
   (the human does it in Airflow).

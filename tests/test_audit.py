@@ -246,7 +246,8 @@ def test_resume_then_pick_a_problem_and_type_go_once(
     assert seen["injected"] == []
     assert "DAG 1 — train" in text
     assert text.rstrip().endswith(
-        f"➡️ {label}: ready. Send any message (e.g. 'go') and the agent continues from here."
+        f"➡️ {label}: ready. Send any message (e.g. \x1b[1;33m'go'\x1b[0m) and the agent "
+        "continues from here."
     )
     pending = wf.load_current().pending  # type: ignore[union-attr]
     assert pending is not None and "airflow_get_dag_source" in pending["then"]
@@ -317,3 +318,15 @@ def test_desktop_and_terminal_behave_the_same(
     assert seen["asked"][1:] == ["Which DAG should I diagnose?", "Which problem first?"]
     assert "DAG 1 — train" in text and "1.1 transform — critical" in text
     assert "stopped" in text and seen["injected"] == []
+
+
+def test_go_is_yellow_in_a_terminal_and_bold_elsewhere(ctx: FakeContext) -> None:
+    """User request: the 'go' to type must stand out."""
+    from airflow_mlops.audit_tools import AuditCommands, AuditTools
+
+    runtime = PluginRuntime(ctx)
+    commands = AuditCommands(ctx, ReadTools(runtime), AuditTools(runtime, ReadTools(runtime)))
+    assert "\x1b[1;33m'go'\x1b[0m" in commands._go("1.1", {"platform": "local"})
+    ctx.session_surface = lambda: "desktop"  # type: ignore[attr-defined]
+    desktop = commands._go("1.1", {"platform": "local"})
+    assert "**'go'**" in desktop and "\x1b[" not in desktop

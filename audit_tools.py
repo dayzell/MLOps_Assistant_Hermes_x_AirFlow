@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 import re
+from pathlib import Path
 from typing import Any
 
 from . import workflow as wf
@@ -29,7 +30,11 @@ from .tools import (
 logger = logging.getLogger(__name__)
 
 MAX_DAGS_PER_PLAN = 10
-GO = "➡️ {label}: ready. Send any message (e.g. 'go') and the agent continues from here."
+# Surfaces that print command output in a terminal (ANSI colors work there).
+TERMINAL_SURFACES = frozenset({"cli", "tui", "local"})
+YELLOW_BOLD = "\x1b[1;33m"
+RESET = "\x1b[0m"
+GO = "➡️ {label}: ready. Send any message (e.g. {go}) and the agent continues from here."
 _RUNS_SCANNED = 10
 
 
@@ -257,6 +262,26 @@ class AuditTools:
             logger.warning("airflow-mlops: could not record the retry", exc_info=True)
             return None
 
+    def observe_applied(self, dag_id: str, paths: list[str]) -> None:
+        """A sandbox-tested fix was written to the DAG file: its items become 'applied'."""
+        try:
+            audit = wf.load_current()
+            if audit is None or audit.status != wf.AUDIT_OPEN:
+                return
+            items = [i for i in audit.items if i.dag_id == dag_id and i.state == "sandbox_passed"]
+            if not items:
+                return
+            ts = self.runtime.now().timestamp()
+            for item in items:
+                item.state, item.updated_at = "applied", ts
+                item.note = "written: " + ", ".join(Path(p).name for p in paths)
+            audit.current = items[0].number
+            wf.save_audit(audit)
+            numbers = ", ".join(i.number for i in items)
+            self.board.show(audit, f"{numbers}: applied to the file")
+        except Exception:
+            logger.warning("airflow-mlops: could not record the applied fix", exc_info=True)
+
     def context(self, session_id: str | None) -> str | None:
         """Dossier reminder for ``pre_llm_call``; never raises."""
         try:
@@ -473,7 +498,7 @@ class AuditCommands:
             if kind == "model":  # the agent must do this step (retry preview, code...)
                 audit.pending = {"label": picked["label"], "then": picked["then"]}
                 wf.save_audit(audit)
-                return _join([*lines, GO.format(label=picked["label"])])
+                return _join([*lines, self._go(picked["label"], kwargs)])
             try:
                 following = self._run_here(audit, picked, kwargs, lines)
             except Exception as exc:  # Airflow down, DAG not allowed...: say it, keep the audit
@@ -516,10 +541,25 @@ class AuditCommands:
         refreshed = wf.load_current() or audit
         refreshed.pending = {"label": picked["label"], "then": str(step.get("next_action"))}
         wf.save_audit(refreshed)
-        lines.append(GO.format(label=picked["label"]))
+        lines.append(self._go(picked["label"], kwargs))
         return None
 
     # ------------------------------------------------------------------ Hermes features
+
+    def _go(self, label: str, kwargs: dict[str, Any]) -> str:
+        """The "send 'go'" line, with 'go' in bold yellow in a terminal (ANSI) and in bold
+        Markdown elsewhere (Desktop, messaging), so it cannot be missed."""
+        surface = ""
+        getter = getattr(self._ctx, "session_surface", None)
+        try:
+            surface = str(getter() or "") if getter is not None else ""
+        except Exception:
+            surface = ""
+        platform = str(kwargs.get("platform") or "")
+        logger.info("airflow-mlops: /airflow-audit surface=%r platform=%r", surface, platform)
+        terminal = surface in TERMINAL_SURFACES or (not surface and platform in TERMINAL_SURFACES)
+        word = f"{YELLOW_BOLD}'go'{RESET}" if terminal else "**'go'**"
+        return GO.format(label=label, go=word)
 
     def _ask(self, question: dict[str, Any]) -> dict[str, str] | None:
         ask = getattr(self._ctx, "ask_choice", None)

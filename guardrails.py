@@ -27,6 +27,7 @@ from typing import Any
 from . import storage
 from .airflow_client import AirflowClient, AirflowError
 from .config import Settings
+from .dag_guard import FILE_TOOLS, SHELL_TOOLS, DagWriteGuard
 from .diagnosis import CRITICAL, TRANSIENT, UNKNOWN, RuleSet, read_and_classify
 
 logger = logging.getLogger(__name__)
@@ -126,12 +127,17 @@ def _summary(args: dict[str, Any]) -> str:
     )
 
 
-def make_pre_tool_call_hook(settings_provider: Callable[[], Settings]) -> Callable[..., Any]:
-    """Build the ``pre_tool_call`` callback guarding ``airflow_clear_tasks``."""
+def make_pre_tool_call_hook(
+    settings_provider: Callable[[], Settings], guard: DagWriteGuard | None = None
+) -> Callable[..., Any]:
+    """Build the ``pre_tool_call`` callback guarding ``airflow_clear_tasks``, the sandbox and
+    (with ``guard``) Hermes' writes to DAG files."""
 
     def pre_tool_call(
         tool_name: str = "", args: dict[str, Any] | None = None, **kwargs: Any
     ) -> dict[str, Any] | None:
+        if guard is not None and tool_name in GUARDED_TOOLS:
+            return _guard_decision(guard, tool_name, args)
         if tool_name == SANDBOX_TOOL:
             return _sandbox_decision(settings_provider, args)
         if tool_name != CLEAR_TOOL:
@@ -512,3 +518,29 @@ class ClearTasksAction:
         except Exception:
             logger.error("airflow-mlops: AUDIT LOG WRITE FAILED", exc_info=True)
             return None
+
+
+GUARDED_TOOLS = FILE_TOOLS | SHELL_TOOLS
+
+
+def _guard_decision(
+    guard: DagWriteGuard, tool_name: str, args: dict[str, Any] | None
+) -> dict[str, Any] | None:
+    """DAG write lock; on an internal error, a human decides (never a silent write)."""
+    call = args if isinstance(args, dict) else {}
+    try:
+        return guard.decide(tool_name, call)
+    except Exception:
+        logger.exception("airflow-mlops: DAG write guard failed")
+        try:
+            root = guard.root_text()
+        except Exception:
+            root = ""
+        if root and root.lower() in repr(call).replace("\\\\", "/").replace("\\", "/").lower():
+            return {
+                "action": "approve",
+                "message": "airflow-mlops could not check this change of a DAG file; "
+                "approve only if you know it.",
+                "rule_key": f"dag_guard_error:{tool_name}",
+            }
+        return None

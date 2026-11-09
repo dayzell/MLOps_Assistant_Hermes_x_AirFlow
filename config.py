@@ -17,6 +17,7 @@ TOOLSET = "airflow"
 API_VERSIONS = ("v1", "v2")
 AUTH_MODES = ("basic", "token", "jwt")
 SANDBOX_LEVELS = ("import", "structure", "task")
+DAG_WRITE_GUARD_MODES = ("sandbox_required", "approval_only", "off")
 SANDBOX_MAX_TIMEOUT = 540  # Hermes' terminal foreground limit is 600 s
 
 
@@ -76,6 +77,7 @@ DEFAULTS: dict[str, Any] = {
         "@task.external_python",
     ],
     "sandbox_max_tests_per_session": 5,
+    "dag_write_guard": "sandbox_required",
 }
 
 
@@ -167,6 +169,7 @@ class Settings:
     sandbox_sample_rows: int = DEFAULTS["sandbox_sample_rows"]
     sandbox_heavy_operators: tuple[str, ...] = tuple(DEFAULTS["sandbox_heavy_operators"])
     sandbox_max_tests_per_session: int = DEFAULTS["sandbox_max_tests_per_session"]
+    dag_write_guard: str = DEFAULTS["dag_write_guard"]
 
     @classmethod
     def from_source(cls, source: ConfigSource) -> Settings:
@@ -242,6 +245,9 @@ class Settings:
                 raw("sandbox_max_tests_per_session"),
                 DEFAULTS["sandbox_max_tests_per_session"],
                 0,
+            ),
+            dag_write_guard=_as_choice(
+                raw("dag_write_guard"), DAG_WRITE_GUARD_MODES, DEFAULTS["dag_write_guard"]
             ),
         )
 

@@ -19,9 +19,25 @@ from plugins.plugin_storage import plugin_db
 
 from .config import PLUGIN_NAME
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 _MIGRATIONS: dict[int, list[str]] = {
+    5: [
+        # DAG write lock: fingerprints of every change that passed a sandbox test.
+        """
+        CREATE TABLE IF NOT EXISTS tested_changes (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            path        TEXT NOT NULL,
+            dag_id      TEXT NOT NULL,
+            level       TEXT NOT NULL,
+            patch_file  TEXT NOT NULL,
+            before_fp   TEXT,
+            after_fp    TEXT NOT NULL,
+            tested_at   REAL NOT NULL
+        )
+        """,
+        "CREATE INDEX IF NOT EXISTS tested_changes_path ON tested_changes (path)",
+    ],
     4: [
         # Guided audits (plan v2): one dossier per audit, numbered items (1.1, 1.2, 2.1...).
         """

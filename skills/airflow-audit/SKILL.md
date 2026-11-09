@@ -78,8 +78,10 @@ under each step.
 - Never retry a DAG while one of its tasks still crashes on a code error: the plugin then
   lists the problems left (same DAG first) instead of offering the retry; do not offer it
   yourself. The masking item (a final task's trigger_rule hiding the failure) does not block.
-- Never change a DAG file before its sandbox test passed **and** the user picked "Apply it";
-  the approval prompt of the file tool is the final human validation.
+- Never change a DAG file before its sandbox test passed **and** the user picked "Apply it".
+  The plugin's lock enforces it: only the tested change gets through (apply it with
+  `apply_commands.apply`), and Hermes asks the user to approve. A block message is not an
+  error to work around: follow it (test again, or apply the tested patch).
 - Keep the plugin's numbers (1.1, 2.3…) for the whole audit; never renumber.
 - "yes" / "go" answers the last question with its recommended option; ask again if unsure.
 - A tool error (`ok: false`) is not a step: explain it and ask the same question again.

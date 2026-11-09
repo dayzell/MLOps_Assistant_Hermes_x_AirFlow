@@ -3,7 +3,7 @@
 Plugin **Hermes Agent** autonome qui transforme l'agent en assistant MLOps pour **Apache Airflow** :
 surveillance des DAGs, diagnostic de pannes, relance ciblée et protégée, rapports de monitoring normés.
 
-> **État : v0.9.0 — phases 1 à 5 livrées, validé sur Airflow 2.9.3 et 3.4.0**
+> **État : v0.10.0 — phases 1 à 5 livrées, validé sur Airflow 2.9.3 et 3.4.0**
 > - Fait : outils en lecture seule, redaction, diagnostic de panne avec classification
 >   transient / critical, rapports normés, commande `/airflow-report`, 3 skills, et
 >   remédiation protégée (relance ciblée, approbation humaine, politique de relance
@@ -15,7 +15,8 @@ surveillance des DAGs, diagnostic de pannes, relance ciblée et protégée, rapp
 >   Ligne directrice : [docs/PLAN_V2_PARCOURS_GUIDE.md](docs/PLAN_V2_PARCOURS_GUIDE.md).
 >   Étapes 0 à 2 livrées : `/airflow-ui-check`, l'audit guidé (`/airflow-audit`,
 >   `/airflow-status`, outils `airflow_audit_*`, skill `airflow-audit`), puis le traitement
->   par lot et la barre d'avancement mise à jour sur place.
+>   par lot et la barre d'avancement mise à jour sur place, puis le **verrou sur les DAGs**
+>   (étape 3).
 
 📘 **Vue d'ensemble simple des fonctionnalités, des outils et des réglages :
 [docs/GUIDE_UTILISATEUR.md](docs/GUIDE_UTILISATEUR.md).** Ce README est la référence technique.
@@ -66,6 +67,7 @@ Les secrets sont saisis à l'installation (`hermes plugins install`) et lus excl
 | `data_quality_xcom_key` | `data_quality` | Clé XCom de la convention qualité (voir plus bas) |
 | `sla_thresholds` | `{}` | Seuils SLA en secondes : `{"dag_id": 3600, "dag_id.task_id": 600}` |
 | `report_default_period` | `24h` | Période par défaut des rapports |
+| `dag_write_guard` | `sandbox_required` | Verrou sur les fichiers des DAGs : seul le changement testé en bac à sable passe, après votre validation (`approval_only`, `off`) |
 | `auto_remediation_enabled` | `false` | Relance auto, sans approbation, des erreurs transitoires (bornée, voir « Remédiation ») |
 | `auto_retry_max_attempts` | `2` | Tentatives auto max par `(dag_id, run_id, task_id)` |
 | `auto_retry_backoff_seconds` | `300` | Backoff de base (doublé à chaque tentative) |
@@ -597,6 +599,37 @@ suivante : la tâche de contrôle qualité pousse un XCom de clé `data_quality_
 Sans XCom conforme, la section indique « not instrumented » : le rapport n'invente jamais de
 chiffres. Exemple dans [demo-local-airflow/dags/mlops_demo.py](demo-local-airflow/dags/mlops_demo.py).
 
+## Verrou sur les DAGs (`dag_write_guard`, plan v2 étape 3)
+
+Hermes reste un agent de code complet ; le plugin ajoute **un seul verrou**, sur les fichiers
+du dossier des DAGs (`sandbox_dags_path`) : **seul le changement exact qui a réussi un test en
+bac à sable peut y être écrit, et Hermes demande votre validation**. Partout ailleurs, ses
+outils de fichiers et son terminal fonctionnent normalement.
+
+| Hermes veut… (dans le dossier des DAGs) | Décision |
+|---|---|
+| `write_file` / `patch` sans test réussi | **bloqué** : « testez d'abord avec airflow_sandbox_test » |
+| `write_file` / `patch` qui produit exactement le fichier testé | **votre validation** est demandée |
+| `write_file` / `patch` qui produit autre chose | **bloqué**, avec la commande qui applique le correctif testé |
+| le fichier a changé depuis le test | **bloqué** : refaire le test sur le fichier actuel |
+| `git apply` du `.patch` testé (terminal) | **votre validation** est demandée (`git apply -R` pour annuler aussi) |
+| `git apply` d'un autre patch | **bloqué** |
+| autre commande du terminal ou code Python qui écrit dans ce dossier | **votre validation**, avec un avertissement (le plugin ne peut pas la vérifier) |
+| lire (`read_file`, `cat`, `grep`, `git diff`, `git apply --check`), ou tout autre dossier | libre |
+
+- Chaque test réussi enregistre l'empreinte du fichier avant et après le correctif (table
+  `tested_changes`, gardée 7 jours). Les fins de ligne (CRLF / LF) sont ignorées.
+- Après l'écriture, le hook `post_tool_call` vérifie le fichier, l'inscrit au journal
+  (`dag_write` : `matches_tested_fix` ou `differs_from_tested_fix`) et fait passer le point de
+  l'audit à « applied ».
+- La validation demandée par le plugin porte sur **ce changement-là** : répondre « always »
+  n'autorise pas les changements suivants.
+- Réglage `dag_write_guard` : `sandbox_required` (défaut), `approval_only` (une validation
+  humaine pour toute écriture, sans test), `off`. Si le bac à sable est désactivé, le verrou
+  passe de lui-même en `approval_only`, puisque rien ne peut être testé.
+- **Limite connue** : en mode « yolo » de Hermes, les validations humaines sont sautées (choix
+  de Hermes) ; les blocages, eux, restent actifs.
+
 ## Sécurité
 
 - **Redaction** ([redaction.py](redaction.py)) de tout ce qui est renvoyé au LLM (logs, XComs,
@@ -644,7 +677,7 @@ Le projet a trois niveaux de vérification, du plus rapide au plus réaliste :
 | 3. Test Docker du bac à sable | `python demo-local-airflow/sandbox_smoke_test.py` | ~2–3 min | de vrais conteneurs Airflow |
 | 4. Test de bout en bout | `python demo-local-airflow/e2e_walkthrough.py` | ~1 min | un vrai serveur Airflow et ses vraies réponses |
 
-### 1. Tests unitaires (`pytest`, 429 tests)
+### 1. Tests unitaires (`pytest`, 446 tests)
 
 Ils simulent l'API Airflow avec `respx`, au format exact des versions **v1** (Airflow 2.x) et
 **v2** (Airflow 3.x). La plupart des tests tournent sur les deux versions. Les modules hôtes de
@@ -668,6 +701,7 @@ Docker n'est nécessaire.
 | [test_workflow.py](tests/test_workflow.py) | 40 | **Audit guidé** : numérotation stable, sélection tapée (`1.1, 2.3`, `DAG 2`, `all critical`…), une question entre chaque étape (4 options au plus, recommandée en premier, `Stop here` en dernier), bilan, rappel du dossier |
 | [test_audit.py](tests/test_audit.py) | 32 | Audit guidé de bout en bout : outils `airflow_audit_*`, enregistrement automatique du bac à sable et de la relance, `/airflow-audit` (menu, repli en texte, `Stop here`, reprise), `/airflow-status`, hook `pre_llm_call` |
 | [test_batch.py](tests/test_batch.py) | 9 | **Traitement par lot** : correctifs d'un même DAG testés et appliqués ensemble, relances groupées (sans les DAGs encore à corriger), barre d'avancement mise à jour sur place |
+| [test_dag_guard.py](tests/test_dag_guard.py) | 15 | **Verrou sur les DAGs** : écriture non testée bloquée, changement testé soumis à validation (CRLF compris), changement différent bloqué avec la solution, fichier modifié depuis le test, `git apply` du patch testé ou non, commandes qui écrivent, modes, journal après écriture |
 | [test_ui_check.py](tests/test_ui_check.py) | 5 | `/airflow-ui-check` : chaque fonction de Hermes essayée, fonction absente ou refusée signalée |
 | [test_register.py](tests/test_register.py) | 7 | Manifest identique à ce que `register()` enregistre, aucun appel réseau au chargement, aucune lecture de `.env` |
 | [test_textutils.py](tests/test_textutils.py) | 6 | Extraction du bloc d'erreur et troncature |

@@ -11,7 +11,8 @@ from typing import Any
 
 from .audit_tools import AuditCommands, AuditTools
 from .config import TOOLSET
-from .guardrails import make_pre_tool_call_hook
+from .dag_guard import DagWriteGuard
+from .guardrails import GUARDED_TOOLS, make_pre_tool_call_hook
 from .runtime import PluginRuntime
 from .schemas import (
     AUDIT_TOOL_SCHEMAS,
@@ -87,7 +88,15 @@ def register(ctx: Any) -> None:
 
     # Human approval for every real write unless the bounded auto-retry policy allows it,
     # and for sandbox tests above sandbox_max_level.
-    ctx.register_hook("pre_tool_call", make_pre_tool_call_hook(runtime.settings))
+    guard = DagWriteGuard(runtime.settings, _session_cwd(ctx), on_applied=audits.observe_applied)
+    ctx.register_hook("pre_tool_call", make_pre_tool_call_hook(runtime.settings, guard))
+
+    def post_tool_call(tool_name: str = "", args: Any = None, **kwargs: Any) -> None:
+        """After Hermes wrote a DAG file: journal it, move the audit item to 'applied'."""
+        if tool_name in GUARDED_TOOLS and isinstance(args, dict):
+            guard.after(tool_name, args, kwargs.get("result"))
+
+    ctx.register_hook("post_tool_call", post_tool_call)
 
     ctx.register_command(
         "airflow-report",
@@ -127,3 +136,9 @@ def register(ctx: Any) -> None:
 
     for name, description in SKILLS.items():
         ctx.register_skill(name, SKILLS_DIR / name / "SKILL.md", description=description)
+
+
+def _session_cwd(ctx: Any) -> Any:
+    """Working directory of the calling session (relative paths of Hermes' file tools)."""
+    getter = getattr(ctx, "session_cwd", None)
+    return getter if callable(getter) else None

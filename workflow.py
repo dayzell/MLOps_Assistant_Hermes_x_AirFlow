@@ -755,9 +755,11 @@ def next_step(audit: Audit, item: Item | None, *, sandbox_enabled: bool) -> dict
                 [
                     option(
                         f"Apply {it} (your approval required)",
-                        "Edit the file with your file tools exactly as tested (sandbox result: "
-                        "changes / patch_file), read it back and show the changed lines; then "
-                        f'call {progress}, state="applied".',
+                        "Apply exactly the tested fix: run apply_commands.apply of the sandbox "
+                        "result (git apply of the tested patch) with the terminal tool. The "
+                        "airflow-mlops lock lets only this tested change through and Hermes asks "
+                        "the user to approve it. Then read the file back, show the changed lines "
+                        f'and call {progress}, state="applied" (recorded automatically too).',
                     ),
                     option(
                         f"I'll apply {it} myself",
