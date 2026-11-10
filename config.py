@@ -198,7 +198,8 @@ class Settings:
             timeout_seconds=_as_float(raw("timeout_seconds"), DEFAULTS["timeout_seconds"], 1.0),
             max_retries=_as_int(raw("max_retries"), DEFAULTS["max_retries"], 0),
             page_size=_as_int(raw("page_size"), DEFAULTS["page_size"], 1),
-            dag_allowlist=tuple(_as_str_list(raw("dag_allowlist"), DEFAULTS["dag_allowlist"])),
+            # A malformed allowlist (null, a mapping...) allows nothing: never fall back to "*".
+            dag_allowlist=tuple(_as_str_list(raw("dag_allowlist"), [])),
             read_only=_as_bool(raw("read_only"), DEFAULTS["read_only"]),
             log_max_lines=_as_int(raw("log_max_lines"), DEFAULTS["log_max_lines"], 1),
             log_max_chars=_as_int(raw("log_max_chars"), DEFAULTS["log_max_chars"], 200),

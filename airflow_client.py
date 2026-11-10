@@ -8,6 +8,7 @@ and never a traceback.
 from __future__ import annotations
 
 import ast
+import hashlib
 import time
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
@@ -20,7 +21,7 @@ import httpx
 from .config import Settings
 from .redaction import redact_text
 
-USER_AGENT = "hermes-airflow-mlops/0.1"
+USER_AGENT = "hermes-airflow-mlops/1.3"
 _RETRYABLE_STATUS = frozenset({502, 503, 504})
 _MAX_PAGES = 50  # hard stop for runaway pagination
 
@@ -45,6 +46,11 @@ class Credentials:
     username: str | None = field(default=None, repr=False)
     password: str | None = field(default=None, repr=False)
     token: str | None = field(default=None, repr=False)
+
+    def digest(self) -> str:
+        """Fingerprint of the values (detects a changed secret without keeping it in clear)."""
+        raw = "\0".join(v or "" for v in (self.username, self.password, self.token))
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
     def require_for(self, auth_mode: str) -> None:
         """Raise a configuration error when the secrets needed by ``auth_mode`` are missing."""
@@ -280,7 +286,14 @@ class AirflowClient:
             items.extend(batch)
             total = page.get("total_entries") if isinstance(page, dict) else None
             offset += len(batch)
-            if len(batch) < limit or (isinstance(total, int) and offset >= total):
+            if not batch:
+                break
+            if isinstance(total, int):
+                # Airflow may return fewer items than asked (maximum_page_limit): a short
+                # page is the last one only when the total says so.
+                if offset >= total:
+                    break
+            elif len(batch) < limit:
                 break
         return items
 
@@ -400,14 +413,11 @@ class AirflowClient:
         *,
         limit: int = 10,
         states: Iterable[str] | None = None,
-        start_date_gte: str | None = None,
     ) -> list[dict[str, Any]]:
-        """Most recent runs first. ``start_date_gte`` is an ISO-8601 lower bound."""
+        """Most recent runs first."""
         params: dict[str, Any] = {"order_by": "-run_after" if self.is_v2 else "-execution_date"}
         if states:
             params["state"] = list(states)
-        if start_date_gte:
-            params["start_date_gte"] = start_date_gte
         raw = self._paginate(f"/dags/{_seg(dag_id)}/dagRuns", "dag_runs", params, max_items=limit)
         return [self._normalize_run(run) for run in raw]
 
@@ -427,6 +437,9 @@ class AirflowClient:
             "logical_date": raw.get("logical_date") or raw.get("execution_date"),
             # Airflow 3: manual runs have no logical_date; run_after (trigger time) is stable
             "run_after": raw.get("run_after"),
+            # Airflow 2: a scheduled run is due at the END of its interval (logical_date is
+            # its start, one schedule period earlier)
+            "data_interval_end": raw.get("data_interval_end"),
             "start_date": raw.get("start_date"),
             "end_date": raw.get("end_date"),
             "duration_s": duration,

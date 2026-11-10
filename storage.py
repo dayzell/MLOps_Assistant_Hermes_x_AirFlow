@@ -19,9 +19,24 @@ from plugins.plugin_storage import plugin_db
 
 from .config import PLUGIN_NAME
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 7
 
 _MIGRATIONS: dict[int, list[str]] = {
+    7: [
+        # Audit items keep their tested fix (patch file, apply command, sandbox level).
+        "ALTER TABLE audit_items ADD COLUMN result TEXT",
+    ],
+    6: [
+        # Scheduled watch: what the previous check saw, so only news is reported.
+        """
+        CREATE TABLE IF NOT EXISTS watch_state (
+            dag_id     TEXT PRIMARY KEY,
+            run_id     TEXT,
+            status     TEXT NOT NULL,
+            updated_at REAL NOT NULL
+        )
+        """,
+    ],
     5: [
         # DAG write lock: fingerprints of every change that passed a sandbox test.
         """
@@ -138,6 +153,26 @@ _MIGRATIONS: dict[int, list[str]] = {
         """,
     ],
 }
+
+
+_MAX_DETAILS_CHARS = 4000
+
+
+def _details_json(details: dict[str, Any] | None) -> str:
+    """Journal details as JSON that always parses: too long, it is replaced by a preview
+    (cutting the JSON text itself made the entry unreadable)."""
+    text = json.dumps(details or {}, default=str)
+    if len(text) <= _MAX_DETAILS_CHARS:
+        return text
+    return json.dumps({"truncated": True, "preview": text[: _MAX_DETAILS_CHARS - 500]})
+
+
+def _loads(raw: Any, default: Any) -> Any:
+    """Stored JSON, or ``default`` when empty or unreadable (entries of older versions)."""
+    try:
+        return json.loads(raw) if raw else default
+    except (TypeError, ValueError):
+        return default
 
 
 @contextmanager
@@ -363,7 +398,7 @@ def add_audit_entry(
                 int(auto),
                 (reason or "")[:1000],
                 outcome,
-                json.dumps(details or {}, default=str)[:4000],
+                _details_json(details),
             ),
         )
         return int(cursor.lastrowid or 0)
@@ -398,12 +433,12 @@ def list_audit_entries(
                 "tool": row[4],
                 "dag_id": row[5],
                 "run_id": row[6],
-                "task_ids": json.loads(row[7] or "[]"),
+                "task_ids": _loads(row[7], []),
                 "dry_run": bool(row[8]),
                 "auto": bool(row[9]),
                 "reason": row[10],
                 "outcome": row[11],
-                "details": json.loads(row[12] or "{}"),
+                "details": _loads(row[12], {}),
             }
         )
     return entries
@@ -465,7 +500,7 @@ def update_audit_entry(entry_id: int, *, outcome: str, details: dict[str, Any] |
     with connect() as conn:
         conn.execute(
             "UPDATE audit_log SET outcome = ?, details = ? WHERE id = ?",
-            (outcome, json.dumps(details or {}, default=str)[:4000], entry_id),
+            (outcome, _details_json(details), entry_id),
         )
 
 

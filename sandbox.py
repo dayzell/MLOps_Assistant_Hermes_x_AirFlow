@@ -5,8 +5,10 @@ Flow of ``airflow_sandbox_test``:
     2. workspace   copy of ``sandbox_dags_path`` in ``plugin_data_dir``; the user's files
                    are never modified; the unified diff is applied to the copy
     3. container   ``docker run`` with hard limits, no network, no secrets, read-only,
-                   launched through ``ctx.dispatch_tool("terminal", ...)`` so Hermes'
-                   approval pipeline applies
+                   launched through ``ctx.dispatch_tool("terminal", ...)``: the terminal
+                   tool's own dangerous-command guards apply, plugin ``pre_tool_call``
+                   hooks do not (the human gate is the hook on ``airflow_sandbox_test``
+                   itself, for levels above ``sandbox_max_level``)
     4. result      parsed from the ``SANDBOX_RESULT`` line; OOM / timeout detected
     5. cleanup     workspace removed, test journaled in the audit log
 
@@ -211,10 +213,18 @@ def apply_unified_diff(root: Path, patch: str) -> list[str]:
                 )
             lines[position : position + len(old)] = new
             cursor = position + len(new)
+        if not file_patch.is_new and lines == original:
+            continue  # this file's hunks change nothing
         target.parent.mkdir(parents=True, exist_ok=True)
         body = newline.join(lines) + (newline if trailing and lines else "")
         target.write_text(body, encoding="utf-8", newline="")
         changed.append(target.relative_to(root).as_posix())
+    if not changed:
+        # An unchanged DAG loads like the original: the test would "pass" and prove nothing.
+        raise SandboxError(
+            "The patch changes nothing: its added lines are the same as the removed ones. "
+            "Write a diff that really modifies the code."
+        )
     return changed
 
 
@@ -323,6 +333,103 @@ def describe_changes(
             }
         )
     return changes, "".join(patch_parts)
+
+
+# Changes that make an error disappear instead of fixing it (the run turns green, the result
+# is wrong). Each rule: (id, regex on an ADDED line, regex a REMOVED line must match or None,
+# explanation). Heuristics: they warn, they never block.
+_MASKING_RULES: tuple[tuple[str, str, str | None, str], ...] = (
+    (
+        "key_lookup_to_get",
+        r"\.get\(",
+        r"\[\s*['\"][^'\"]+['\"]\s*\]",
+        "a key lookup `x['k']` became `x.get('k')`: a missing key no longer fails, the task "
+        "goes on with None",
+    ),
+    (
+        "swallowed_exception",
+        r"^\s*except\b.*:\s*(pass|continue|return(\s+None)?)?\s*(#.*)?$",
+        None,
+        "a new `except` catches the error: the task can succeed with a wrong or empty result",
+    ),
+    (
+        "silent_default",
+        r"(\bor\s+(\{\}|\[\]|None|0|''|\"\")\s*$|\.fillna\(|default\s*=\s*None)",
+        None,
+        "a default value replaces missing data: the error is hidden, the data stays wrong",
+    ),
+    (
+        "removed_check",
+        r".*",
+        r"^\s*(raise\b|assert\b)",
+        "a `raise` / `assert` was removed: a data check no longer stops bad data",
+    ),
+)
+
+
+def masking_warnings(
+    source_root: Path, copy_root: Path, rel_paths: list[str]
+) -> list[dict[str, Any]]:
+    """Spot fixes that hide the error instead of fixing it (heuristic, never blocking)."""
+    found: list[dict[str, Any]] = []
+    for rel in rel_paths:
+        before = _read_exact(source_root / rel)
+        after = _read_exact(copy_root / rel)
+        matcher = difflib.SequenceMatcher(a=before, b=after, autojunk=False)
+        for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+            if tag == "equal":
+                continue
+            removed = "".join(before[i1:i2])
+            added_lines = after[j1:j2]
+            for rule_id, added_rx, removed_rx, why in _MASKING_RULES:
+                if removed_rx is not None and not re.search(removed_rx, removed, re.M):
+                    continue
+                if rule_id == "removed_check":
+                    still = any(re.search(r"^\s*(raise\b|assert\b)", x) for x in added_lines)
+                    if still:
+                        continue
+                    hit_line, hit = j1 + 1, removed.strip().splitlines()[0]
+                else:
+                    hits = [
+                        (j1 + k + 1, x) for k, x in enumerate(added_lines) if re.search(added_rx, x)
+                    ]
+                    if not hits:
+                        continue
+                    hit_line, hit = hits[0][0], hits[0][1].strip()
+                found.append(
+                    {"file": rel, "line": hit_line, "rule": rule_id, "code": hit[:120], "why": why}
+                )
+            found += _swapped_keys(rel, removed, added_lines, j1)
+    return found[:10]
+
+
+_SUBSCRIPT = re.compile(r"(\w+)\[\s*['\"]([^'\"]+)['\"]\s*\]")
+
+
+def _swapped_keys(rel: str, removed: str, added: list[str], start: int) -> list[dict[str, Any]]:
+    """`frame["target"]` became `frame["features"]`: the KeyError disappears, but the task now
+    reads other data. Real case (09/11): the model proposed exactly this "fix"."""
+    before = {(var, key) for var, key in _SUBSCRIPT.findall(removed)}
+    found = []
+    for offset, line in enumerate(added):
+        for var, key in _SUBSCRIPT.findall(line):
+            old_keys = {k for v, k in before if v == var and k != key}
+            still_read = any(f'{var}["{k}"]' in line or f"{var}['{k}']" in line for k in old_keys)
+            if old_keys and not still_read and (var, key) not in before:
+                old = sorted(old_keys)[0]
+                found.append(
+                    {
+                        "file": rel,
+                        "line": start + offset + 1,
+                        "rule": "key_swapped",
+                        "code": line.strip()[:120],
+                        "why": f"`{var}['{old}']` now reads `{var}['{key}']`: the error goes "
+                        "away but the task uses other data; fix the producer of "
+                        f"'{old}' instead",
+                    }
+                )
+                return found
+    return found
 
 
 def save_patch(patch: str, dag_id: str) -> Path:
@@ -524,10 +631,6 @@ class SandboxRequest:
     run_id: str | None = None
 
 
-def level_rank(level: str) -> int:
-    return SANDBOX_LEVELS.index(level)
-
-
 class SandboxRunner:
     """Prepare, run and journal one sandbox test."""
 
@@ -558,6 +661,11 @@ class SandboxRunner:
             self._journal(request, "error", exc.to_dict())
             raise
         outcome = "passed" if result.get("passed") else "failed"
+        if not result.get("passed") and self.tested_patch:
+            # Only a passing patch can be applied: a failed one would just push the tested
+            # ones out of the kept set.
+            Path(self.tested_patch).unlink(missing_ok=True)
+            result.pop("apply_commands", None)
         if result.get("passed") and self.tested_files:
             try:  # the lock lets this exact change (and only it) be applied, after approval
                 record_tested(request.dag_id, request.level, self.tested_patch, self.tested_files)
@@ -666,12 +774,15 @@ class SandboxRunner:
                 files_copied=copied,
                 your_files_modified=False,
                 changes=changes,
+                masking_warnings=masking_warnings(dags_path, dags_copy, patched),
                 patch_file=patch_file.as_posix(),
                 apply_commands=apply_commands(dags_path, patch_file),
                 note=(
                     "Tested on a temporary copy: the user's DAG files were NOT modified. Show "
                     "'changes' (exact file and lines) and the result, then stop: the user "
-                    "chooses whether to have the file edited or to run 'apply_commands'."
+                    "chooses whether to have the file edited or to run 'apply_commands'. If "
+                    "'masking_warnings' is not empty, say FIRST that the fix may hide the "
+                    "error instead of fixing it (the sandbox only proves the DAG loads)."
                 ),
                 limits={
                     "cpus": self.settings.sandbox_cpus,

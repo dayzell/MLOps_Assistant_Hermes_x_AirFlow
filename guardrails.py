@@ -109,6 +109,15 @@ def evaluate_auto_policy(
 # ============================================================================ approval hook
 
 
+def _is_true(value: Any) -> bool:
+    """Only a real ``true`` counts. The hook sees the arguments as the model wrote them,
+    before Hermes converts strings to their schema type: ``"false"`` must not pass for a
+    dry run here and become a real clear in the handler."""
+    if isinstance(value, str):
+        return value.strip().lower() == "true"
+    return value is True
+
+
 def _summary(args: dict[str, Any]) -> str:
     tasks = args.get("task_ids")
     task_text = ", ".join(str(t) for t in tasks) if isinstance(tasks, list) else "?"
@@ -137,14 +146,14 @@ def make_pre_tool_call_hook(
         tool_name: str = "", args: dict[str, Any] | None = None, **kwargs: Any
     ) -> dict[str, Any] | None:
         if guard is not None and tool_name in GUARDED_TOOLS:
-            return _guard_decision(guard, tool_name, args)
+            return _guard_decision(guard, tool_name, args, kwargs.get("session_id"))
         if tool_name == SANDBOX_TOOL:
             return _sandbox_decision(settings_provider, args)
         if tool_name != CLEAR_TOOL:
             return None
         try:
             call = args if isinstance(args, dict) else {}
-            if call.get("dry_run", True) is not False:
+            if _is_true(call.get("dry_run", True)):
                 return None  # dry runs are read-only: no approval needed
             settings = settings_provider()
             if settings.read_only:
@@ -163,7 +172,7 @@ def make_pre_tool_call_hook(
                     dag_id,
                     run_id,
                     [str(t) for t in task_ids],
-                    only_failed=call.get("only_failed", True) is not False,
+                    only_failed=_is_true(call.get("only_failed", True)),
                 )
                 if decision.allowed:
                     return None  # bounded automatic retry of a transient failure
@@ -318,10 +327,10 @@ class ClearTasksAction:
                 "re-running a whole DAG is never done by this plugin. Clear only the failed root "
                 "task(s) with only_failed=true."
             )
-        states = {
-            str(ti["task_id"]): str(ti.get("state") or "")
-            for ti in self.client.list_task_instances(request.dag_id, request.run_id)
-        }
+        # Every instance of a task counts (mapped tasks have one per map_index).
+        states: dict[str, set[str]] = {}
+        for ti in self.client.list_task_instances(request.dag_id, request.run_id):
+            states.setdefault(str(ti["task_id"]), set()).add(str(ti.get("state") or ""))
 
         classification = self._classifications(request, states)
         critical = sorted(t for t, c in classification.items() if c == CRITICAL)
@@ -342,7 +351,15 @@ class ClearTasksAction:
             include_downstream=request.include_downstream,
         )
         cleared_ids = {str(ti["task_id"]) for ti in preview}
-        rerun_succeeded = sorted(t for t in cleared_ids if states.get(t) == "success")
+        # What the preview would clear, instance by instance (its state is the one before the
+        # clear); the run's states when the preview does not give them.
+        previewed: dict[str, set[str]] = {}
+        for ti in preview:
+            if ti.get("state"):
+                previewed.setdefault(str(ti["task_id"]), set()).add(str(ti["state"]))
+        rerun_succeeded = sorted(
+            t for t in cleared_ids if "success" in previewed.get(t, states.get(t, set()))
+        )
         if len(dag_tasks) > 1 and cleared_ids >= dag_tasks and rerun_succeeded:
             raise GuardrailError(
                 "Refusing: with these options the whole DAG would be re-run, including tasks "
@@ -441,27 +458,28 @@ class ClearTasksAction:
         if not request.dry_run and not request.reason.strip():
             raise GuardrailError("A 'reason' is required when dry_run=false (it is journaled).")
 
-    def _classifications(self, request: ClearRequest, states: dict[str, str]) -> dict[str, str]:
+    def _classifications(
+        self, request: ClearRequest, states: dict[str, set[str]]
+    ) -> dict[str, str]:
         """Category per requested task: cached diagnosis, else classify the latest try now."""
         result: dict[str, str] = {}
         missing: list[str] = []
+        # One instance per task: a failed one when there is one (mapped tasks).
+        instances: dict[str, dict[str, Any]] = {}
+        for instance in self.client.list_task_instances(request.dag_id, request.run_id):
+            task_id = str(instance["task_id"])
+            if task_id not in instances or instance.get("state") in ("failed", "up_for_retry"):
+                instances[task_id] = instance
+        del states  # states only tell failed vs not; the full instance is needed to read logs
         for task_id in request.task_ids:
             cached = storage.get_diagnosis(request.dag_id, request.run_id, task_id)
-            if cached is not None:
+            current_try = (instances.get(task_id) or {}).get("try_number")
+            # A classification is about one try: after a new failed try it is read again
+            # (a first OOM is transient, the same OOM on the next try is critical).
+            if cached is not None and cached.try_number in (None, current_try):
                 result[task_id] = cached.category
             else:
                 missing.append(task_id)
-        if not missing:
-            return result
-        instances = (
-            {
-                str(ti["task_id"]): ti
-                for ti in self.client.list_task_instances(request.dag_id, request.run_id)
-            }
-            if missing
-            else {}
-        )
-        del states  # states only tell failed vs not; the full instance is needed to read logs
         for task_id in missing:
             ti = instances.get(task_id)
             if ti is None or ti.get("state") not in ("failed", "up_for_retry"):
@@ -524,12 +542,12 @@ GUARDED_TOOLS = FILE_TOOLS | SHELL_TOOLS
 
 
 def _guard_decision(
-    guard: DagWriteGuard, tool_name: str, args: dict[str, Any] | None
+    guard: DagWriteGuard, tool_name: str, args: dict[str, Any] | None, session_id: Any = None
 ) -> dict[str, Any] | None:
     """DAG write lock; on an internal error, a human decides (never a silent write)."""
     call = args if isinstance(args, dict) else {}
     try:
-        return guard.decide(tool_name, call)
+        return guard.decide(tool_name, call, str(session_id) if session_id else None)
     except Exception:
         logger.exception("airflow-mlops: DAG write guard failed")
         try:

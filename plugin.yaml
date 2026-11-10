@@ -1,10 +1,11 @@
 name: airflow-mlops
-version: 0.10.0
+version: 1.3.0
 description: Apache Airflow MLOps assistant — monitor DAGs, diagnose failed runs, targeted retries and standard reports
 author: Joseph Keita
 manifest_version: 2
 api_version: 1
 license: MIT
+homepage: https://github.com/dayzell/MLOps_Assistant_Hermes_x_AirFlow
 requires_hermes: ">=0.23"
 tags:
   - airflow
@@ -21,6 +22,8 @@ provides_tools:
   - airflow_get_xcoms
   - airflow_get_dependencies
   - airflow_get_dag_source
+  - airflow_review_dag
+  - airflow_watch_check
   - airflow_diagnose_run
   - airflow_build_report
   - airflow_clear_tasks
@@ -28,6 +31,7 @@ provides_tools:
   - airflow_audit_plan
   - airflow_audit_select
   - airflow_audit_progress
+  - airflow_audit_timeline
 
 provides_hooks:
   - pre_tool_call

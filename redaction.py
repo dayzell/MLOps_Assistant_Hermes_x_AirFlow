@@ -79,6 +79,12 @@ _TEXT_RULES: list[tuple[re.Pattern[str], str]] = [
 ]
 
 
+# Source code: the unquoted ``key=value`` rule (the last one) is left out. On code it masks
+# names, not values (``def f(token: str)``, ``password = Variable.get(...)``), which made the
+# DAG review report fake secrets and the masked lines unusable as diff context.
+_CODE_RULES = _TEXT_RULES[:-1]
+
+
 def is_sensitive_key(key: str) -> bool:
     """True when a mapping key names a secret (password, token, conn uri, ...)."""
     return bool(_SENSITIVE_KEY_RE.search(key))
@@ -89,6 +95,15 @@ def redact_text(text: str) -> str:
     if not text:
         return text
     for pattern, replacement in _TEXT_RULES:
+        text = pattern.sub(replacement, text)
+    return text
+
+
+def redact_code(text: str) -> str:
+    """Mask the secrets written in source code: literal values, tokens, URIs with a password."""
+    if not text:
+        return text
+    for pattern, replacement in _CODE_RULES:
         text = pattern.sub(replacement, text)
     return text
 

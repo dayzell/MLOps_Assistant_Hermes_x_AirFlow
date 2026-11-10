@@ -137,12 +137,15 @@ asks the user to approve it.
 
 ## Inside a guided audit
 
-If an `[airflow-mlops audit …]` reminder is in context, or the user started with
-`/airflow-audit`, the `airflow-mlops:airflow-audit` skill leads: report each step with
-`airflow_audit_progress` and ask the `next_question` it returns (clarify tool, options as given)
-instead of writing your own question.
+If an `[airflow-mlops audit … in progress]` reminder is in context, or the user started with
+`/airflow-audit`, the `airflow-mlops:airflow-audit` skill leads. **An audit never changes
+code**: show the fix (step A), test it in the sandbox (`import`, then `structure`) right away,
+and end your reply with the `next_question` the plugin returns (numbered text, no menu tool) instead of
+your own question. No "Apply it?" during an audit: the tested fix is applied after the audit,
+on request (see "If the user then asks you to apply the fix").
 
 ## Pitfalls
+
 
 
 - Do not invent file names, line numbers or code: read them with `airflow_get_dag_source`.
@@ -155,6 +158,10 @@ instead of writing your own question.
   makes the run green but the result wrong. When a producer and a consumer disagree on a data
   contract, fix the producer (or ask the user which side is right), and validate the input
   with a clear error.
+- **Even when the user asks for such a change explicitly** (".get()", "catch it", "default
+  value"), warn **before** testing or applying it: one sentence on what it hides, the fix of
+  the cause, then let the user choose. The sandbox result lists these risks in
+  `masking_warnings`: when it is not empty, say it first, before offering to apply.
 - Never say the user's file was patched after a sandbox test: the sandbox only patches a
   temporary copy (`your_files_modified: false`). Take line numbers from `changes`.
 - Never put secrets in the code; reference Airflow Connections / Variables instead.

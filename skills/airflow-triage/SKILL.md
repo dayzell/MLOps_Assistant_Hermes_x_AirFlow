@@ -124,10 +124,11 @@ user makes; nothing in these skills forbids it.
 
 If an `[airflow-mlops audit …]` reminder is in context, or the user started with
 `/airflow-audit`, the `airflow-mlops:airflow-audit` skill leads: report each step with
-`airflow_audit_progress` and ask the `next_question` it returns (clarify tool, options as given)
+`airflow_audit_progress` and end your reply with the `next_question` it returns (numbered text, options as given; no menu tool)
 instead of writing your own question.
 
 ## Pitfalls
+
 
 
 - **Never re-run the whole DAG** or clear tasks that succeeded. Retry the minimum: the root

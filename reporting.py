@@ -282,9 +282,12 @@ class ReportBuilder:
     def _in_window(self, run: dict[str, Any], start: datetime) -> bool:
         # A stable date: start_date moves when a run is cleared for a retry (and is empty while
         # queued); Airflow 3 manual runs have no logical_date but always a run_after.
+        # Airflow 2: a scheduled run is due at the end of its data interval; its logical_date
+        # is one period earlier, so a daily run fell out of a 24h report.
         moment = (
-            parse_datetime(run.get("logical_date"))
-            or parse_datetime(run.get("run_after"))
+            parse_datetime(run.get("run_after"))
+            or parse_datetime(run.get("data_interval_end"))
+            or parse_datetime(run.get("logical_date"))
             or parse_datetime(run.get("start_date"))
         )
         return moment is not None and start <= moment <= self.now
@@ -453,8 +456,15 @@ class ReportBuilder:
             return {}
 
     def _update_baselines(self, stats: list[tuple[str, str, float, float, int]]) -> None:
+        """Blend the new durations into the baselines, at most once per hour per task: the
+        same report built twice (a retried command, a second question) must not move them."""
         try:
+            known: dict[str, dict[str, storage.Baseline]] = {}
             for dag_id, task_id, p50, p95, samples in stats:
+                baselines = known.setdefault(dag_id, self._baselines(dag_id))
+                previous = baselines.get(task_id)
+                if previous is not None and self.now.timestamp() - previous.updated_at < 3600:
+                    continue
                 storage.update_baseline(
                     dag_id,
                     task_id,
@@ -887,7 +897,8 @@ def render_markdown(report: dict[str, Any]) -> str:
         "",
         f"## {SECTION_TITLES['health']}",
         "",
-        f"- Status: **{health['status']}** — {health['status_reason']}",
+        f"- Status: **{STATUS_ICONS[health['status']]} {health['status']}** — "
+        f"{health['status_reason']}",
         f"- DAGs: {counts['healthy']} healthy, {counts['degraded']} degraded, "
         f"{counts['failing']} failing, {counts['no_data']} without runs",
         f"- Runs: {health['total_runs']} (success {health['success']}, failed {health['failed']}, "

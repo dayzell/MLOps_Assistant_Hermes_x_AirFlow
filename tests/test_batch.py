@@ -1,5 +1,5 @@
-"""Plan v2, step 2: batch handling (fixes of one DAG together, retries together) and the
-progress board updated in place."""
+"""Batch handling in an audit: fixes of one DAG proposed and tested together (one sandbox
+run), retries together (one preview, one decision), and the progress board."""
 
 from __future__ import annotations
 
@@ -9,8 +9,8 @@ from airflow_mlops import workflow as wf
 from airflow_mlops.audit_tools import AuditTools
 from airflow_mlops.runtime import PluginRuntime
 from airflow_mlops.tools import ReadTools
-from harness import FakeContext, make_context
-from test_workflow import CANDIDATES, critical_diagnosis, planned_audit, root
+from harness import make_context
+from test_workflow import CANDIDATES, planned_audit, root
 
 
 def select(audit: wf.Audit, *numbers: str) -> None:
@@ -20,52 +20,19 @@ def select(audit: wf.Audit, *numbers: str) -> None:
     wf.save_audit(audit)
 
 
-def set_state(audit: wf.Audit, state: str, *numbers: str) -> None:
-    for number in numbers:
-        item = audit.item(number)
-        assert item is not None
-        item.state = state
-
-
-# ---------------------------------------------------------------------------- groups
-
-
-def test_fixes_of_one_dag_are_proposed_and_tested_together() -> None:
+def test_fixes_of_one_dag_are_tested_in_one_sandbox_run() -> None:
     audit = planned_audit()
     select(audit, "1.1", "1.2")
-    step = wf.next_step(audit, audit.item("1.1"), sandbox_enabled=True)
-    assert step["next_action"].startswith("Fixes 1.1 + 1.2 are in the same DAG")
-    assert 'item="1.1, 1.2", state="fix_proposed"' in step["next_action"]
-
-    set_state(audit, "fix_proposed", "1.1", "1.2")
-    question = wf.next_step(audit, audit.item("1.1"), sandbox_enabled=True)["next_question"]
-    assert question["question"] == "Test fixes 1.1 + 1.2 in the sandbox (one run)?"
-    assert question["choices"][0] == "Test them (one run)"
-    assert "ONE diff containing every fix" in question["options"][0]["then"]
-
-    set_state(audit, "sandbox_passed", "1.1", "1.2")
-    question = wf.next_step(audit, audit.item("1.1"), sandbox_enabled=True)["next_question"]
-    assert (
-        question["question"] == "Fixes 1.1 + 1.2 passed the sandbox test. Apply them to your file?"
-    )
-    assert question["choices"][0] == "Apply them (your approval required)"
+    action = wf.next_step(audit, audit.item("1.1"), sandbox_enabled=True)["next_action"]
+    assert action.startswith("Fixes 1.1 + 1.2: read the code")
+    assert "ONE diff containing every fix" in action
 
 
-def test_a_group_applied_together_unlocks_the_retry() -> None:
-    audit = planned_audit()
-    select(audit, "1.1", "1.2")
-    set_state(audit, "applied", "1.1", "1.2")
-    question = wf.next_step(audit, audit.item("1.1"), sandbox_enabled=True)["next_question"]
-    assert question["question"].startswith("Fixes 1.1 + 1.2 are applied and demo_train_critical")
-    assert question["choices"][0] == "Preview the retry of demo_train_critical (dry run)"
-
-
-def test_a_single_selected_fix_keeps_the_singular_wording() -> None:
+def test_a_single_fix_keeps_the_singular_wording() -> None:
     audit = planned_audit()
     select(audit, "1.1")
-    set_state(audit, "fix_proposed", "1.1")
-    question = wf.next_step(audit, audit.item("1.1"), sandbox_enabled=True)["next_question"]
-    assert question["question"] == "Test fix 1.1 in the sandbox?"
+    action = wf.next_step(audit, audit.item("1.1"), sandbox_enabled=True)["next_action"]
+    assert action.startswith("Fix 1.1: read the code") and 'task_id="train"' in action
 
 
 def test_transient_failures_are_retried_with_one_question() -> None:
@@ -83,33 +50,9 @@ def test_transient_failures_are_retried_with_one_question() -> None:
     select(audit, "1.1", "2.1")
     question = wf.next_step(audit, audit.item("1.1"), sandbox_enabled=True)["next_question"]
     assert question["question"] == "Retry the 2 transient failures (1.1 + 2.1)?"
-    assert question["choices"] == [
-        "Preview all retries (dry run)",
-        "One by one",
-        "Skip them",
-        "Stop here",
-    ]
+    assert question["choices"] == ["Preview all retries (dry run)", "Skip them", "Stop here"]
     then = question["options"][0]["then"]
     assert 'dag_id="demo_fetch_transient"' in then and 'dag_id="other_fetch"' in then
-    assert "ONE combined list" in then
-
-
-def test_a_blocked_transient_is_left_out_of_the_retry_group() -> None:
-    audit = wf.create_audit("all", "24h", [dict(CANDIDATES[0]), dict(CANDIDATES[1])], None)
-    diagnosis = critical_diagnosis()
-    diagnosis["root_failures"].append(root("fetch", "transient", "ConnectionResetError: x"))
-    audit.items += wf.items_from_diagnosis(audit, diagnosis)  # 1.1 train, 1.2 fetch, 1.3 masked
-    audit.items += wf.items_from_diagnosis(
-        audit,
-        {
-            "dag_id": "demo_fetch_transient",
-            "run_id": "r2",
-            "root_failures": [root("fetch", "transient", "ConnectionResetError: y")],
-        },
-    )
-    select(audit, "2.1", "1.2")
-    group = wf.retry_group(audit, audit.item("2.1"))  # type: ignore[arg-type]
-    assert [i.number for i in group] == ["2.1"]  # 1.2 waits for the fixes of DAG 1
 
 
 # ---------------------------------------------------------------------------- tools
@@ -135,42 +78,37 @@ class Board:
         return Handle()
 
 
-def audit_tools(ctx: FakeContext) -> AuditTools:
+def audit_tools(ctx: Any) -> AuditTools:
     runtime = PluginRuntime(ctx)
     return AuditTools(runtime, ReadTools(runtime))
 
 
-def test_progress_accepts_a_group_and_the_board_follows() -> None:
+def test_a_group_passes_together_and_the_board_follows() -> None:
     ctx = make_context()
     board = Board()
     ctx.post_message = board.post_message  # type: ignore[attr-defined]
     tools = audit_tools(ctx)
     planned_audit()
 
-    selected = tools.select({"selection": "DAG 1"})
-    assert '"selected": ["1.1", "1.2"]' in selected
-    assert board.texts[0].startswith("Audit #") and "[-------] 0/2 done" in board.texts[0]
-    assert "starting with 1.1" in board.texts[0]
-
-    tools.progress({"item": "1.1, 1.2", "state": "fix_proposed"})
-    assert board.texts[-1].count("fix proposed") == 3  # header + both lines
+    assert '"selected": ["1.1", "1.2"]' in tools.select({"selection": "DAG 1"})
+    assert "[-------] 0/2 tested" in board.texts[0] and "starting with 1.1" in board.texts[0]
 
     tools.observe_sandbox_start("demo_train_critical", None, "structure")
     assert "testing 1.1, 1.2 in the sandbox (structure)..." in board.texts[-1]
     step = tools.observe_sandbox("demo_train_critical", None, "structure", {"passed": True})
-    assert step is not None and step["items"] == ["1.1", "1.2"]
-    assert step["next_question"]["choices"][0] == "Apply them (your approval required)"
-    audit = wf.load_current()
-    assert audit is not None
-    assert {i.number: i.state for i in audit.items if i.dag_id == "demo_train_critical"} == {
-        "1.1": "sandbox_passed",
-        "1.2": "sandbox_passed",
-    }
+    assert step is not None and step["items"] == ["1.1", "1.2"] and step["state"] == "passed"
+    # 2.1 is left: it is offered, or Stop here
+    assert step["next_question"]["choices"][0].startswith("2.1 fetch")
+    assert "[#######] 2/2 tested" in board.texts[-1]
 
-    tools.progress({"item": "1.1 + 1.2", "state": "verified"})
-    assert "[#######] 2/2 done" in board.texts[-1]
-    tools.progress({"state": "stop"})
-    assert "stopped" in board.texts[-1]
+
+def test_progress_accepts_a_group() -> None:
+    ctx = make_context()
+    planned_audit()
+    result = ctx.call("airflow_audit_progress", item="1.1, 1.2", state="skipped")
+    assert [i["state"] for i in result["items"]] == ["skipped", "skipped"]
+    unknown = ctx.call("airflow_audit_progress", item="1.1, 7.7", state="passed")
+    assert unknown["error"]["type"] == "invalid_argument" and "7.7" in unknown["error"]["message"]
 
 
 def test_a_single_selection_posts_no_board() -> None:
@@ -180,16 +118,3 @@ def test_a_single_selection_posts_no_board() -> None:
     planned_audit()
     audit_tools(ctx).select({"selection": "1.1"})
     assert board.texts == []
-
-
-def test_unknown_items_in_a_group_are_reported() -> None:
-    ctx = make_context()
-    planned_audit()
-    result = ctx.call("airflow_audit_progress", item="1.1, 7.7", state="applied")
-    assert result["error"]["type"] == "invalid_argument" and "7.7" in result["error"]["message"]
-
-
-def test_board_is_silent_without_post_message() -> None:
-    tools = audit_tools(make_context())  # FakeContext has no post_message
-    planned_audit()
-    assert '"selected"' in tools.select({"selection": "all"})

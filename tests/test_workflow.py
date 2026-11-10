@@ -1,4 +1,5 @@
-"""Guided audit (plan v2, step 1): dossier, numbering, typed selection and questions."""
+"""Guided audit, the simple rule (2026-11-09): report → diagnosis → test of each proposal →
+the problems left or "Stop here"; an audit never changes code and is archived when left."""
 
 from __future__ import annotations
 
@@ -67,55 +68,57 @@ def planned_audit(*, both: bool = True) -> wf.Audit:
     return loaded
 
 
+def set_state(audit: wf.Audit, state: str, *numbers: str) -> None:
+    for number in numbers:
+        item = audit.item(number)
+        assert item is not None
+        item.state = state
+
+
+def check_question(question: dict[str, Any]) -> None:
+    assert 2 <= len(question["choices"]) <= wf.MAX_CHOICES  # Hermes clarify limit
+    assert question["recommended"] == question["choices"][0]
+    assert [o["label"] for o in question["options"]] == question["choices"]
+    assert question["choices"][-1] == wf.STOP_LABEL
+
+
 # ---------------------------------------------------------------------------- dossier
 
 
-def test_numbering_follows_the_dag_order_and_survives_a_reload() -> None:
+def test_numbering_and_reload() -> None:
     audit = planned_audit()
     assert [(i.number, i.task_id, i.kind) for i in audit.ordered_items()] == [
         ("1.1", "train", "code_fix"),
         ("1.2", None, "code_fix"),  # the trigger_rule that hides the failure
         ("2.1", "fetch", "retry"),
     ]
-    assert audit.item("1.1").title == "KeyError: 'target'"  # type: ignore[union-attr]
-    assert audit.progress()["line"] == "[-------] 0/3 done · next: 1.1"
+    assert audit.progress()["line"] == "[-------] 0/3 tested · next: 1.1"
 
 
-def test_a_new_audit_supersedes_the_previous_one() -> None:
+def test_a_new_audit_archives_the_previous_one() -> None:
     first = planned_audit()
     second = wf.create_audit("all", "7d", [], None)
     current = wf.load_current()
-    assert current is not None and current.id == second.id != first.id
+    assert current is not None and current.id == second.id
+    old = wf.load_audit(first.id)
+    assert old is not None and old.status == wf.AUDIT_ARCHIVED  # no resume
 
 
-def test_plan_text_is_grouped_by_dag() -> None:
+def test_tested_fix_is_kept_with_the_item() -> None:
+    audit = planned_audit()
+    item = audit.item("1.1")
+    assert item is not None
+    item.state, item.result = "passed", {"level": "structure", "apply": "git -C d apply p"}
+    wf.save_audit(audit)
+    again = wf.load_current()
+    assert again is not None and again.item("1.1").result["apply"] == "git -C d apply p"  # type: ignore[union-attr]
+
+
+def test_plan_text_says_how_each_problem_is_tested() -> None:
     text = wf.plan_text(planned_audit())
     assert text.startswith("DAG 1 — demo_train_critical (latest run marked success")
-    assert "  1.1 train — critical — KeyError: 'target'" in text
-    assert "retry only, no code change" in text
-
-
-def test_candidates_from_report_put_failing_and_masked_first() -> None:
-    report = {
-        "health": {
-            "per_dag": [
-                {"dag_id": "ok", "status": "healthy", "status_reason": "no incident"},
-                {"dag_id": "flaky", "status": "degraded", "status_reason": "1 incident"},
-                {"dag_id": "fetch", "status": "failing", "status_reason": "latest run failed"},
-                {"dag_id": "train", "status": "failing", "status_reason": "masked"},
-            ]
-        },
-        "incidents": {
-            "failed_runs": [
-                {"dag_id": "fetch", "run_id": "f1", "diagnosis": {"fetch": "transient"}},
-                {"dag_id": "train", "run_id": "t1", "masked": True},
-                {"dag_id": "flaky", "run_id": "x1"},
-            ]
-        },
-    }
-    cands = wf.candidates_from_report(report)
-    assert [c["dag_id"] for c in cands] == ["train", "fetch", "flaky"]
-    assert cands[1]["run_id"] == "f1" and cands[1]["category"] == "transient"
+    assert "test: a fix in the sandbox (copy, no code change)" in text
+    assert "test: a real retry, after your approval" in text
 
 
 # ---------------------------------------------------------------------------- selection
@@ -126,15 +129,10 @@ def test_candidates_from_report_put_failing_and_masked_first() -> None:
     [
         ("1.1", ["1.1"]),
         ("1.2, 2.1", ["1.2", "2.1"]),
-        ("1.1-1.2", ["1.1", "1.2"]),
         ("DAG 2", ["2.1"]),
-        ("2", ["2.1"]),
-        ("demo_train_critical", ["1.1", "1.2"]),
         ("all", ["1.1", "1.2", "2.1"]),
         ("all critical", ["1.1", "1.2"]),
-        ("all transient", ["2.1"]),
         ("all except 1.2", ["1.1", "2.1"]),
-        ("1.1 and 2.1", ["1.1", "2.1"]),
     ],
 )
 def test_parse_selection(text: str, expected: list[str]) -> None:
@@ -142,200 +140,65 @@ def test_parse_selection(text: str, expected: list[str]) -> None:
     assert numbers == expected and to_plan == []
 
 
-def test_selection_of_an_unplanned_dag_asks_to_plan_it() -> None:
-    audit = planned_audit(both=False)
-    assert wf.parse_selection("DAG 2", audit) == ([], ["demo_fetch_transient"])
-    assert wf.parse_selection("all", audit) == (["1.1", "1.2"], ["demo_fetch_transient"])
+def test_tested_problems_are_not_selected_again() -> None:
+    audit = planned_audit()
+    set_state(audit, "passed", "1.1")
+    assert wf.parse_selection("all", audit)[0] == ["1.2", "2.1"]
 
 
-@pytest.mark.parametrize("text", ["", "9.9", "DAG 7", "all purple", "1.1 ; ???"])
+@pytest.mark.parametrize("text", ["", "9.9", "DAG 7", "all purple"])
 def test_bad_selection_is_explained(text: str) -> None:
     with pytest.raises(wf.SelectionError):
         wf.parse_selection(text, planned_audit())
 
 
-# ---------------------------------------------------------------------------- questions
+# ---------------------------------------------------------------------------- steps
 
 
-def check_question(question: dict[str, Any]) -> None:
-    assert 2 <= len(question["choices"]) <= wf.MAX_CHOICES  # Hermes clarify limit
-    assert question["recommended"] == question["choices"][0]
-    assert [o["label"] for o in question["options"]] == question["choices"]
-    assert all(o["then"] for o in question["options"])
-
-
-def test_first_question_after_the_report() -> None:
-    question = wf.question_after_report([dict(c) for c in CANDIDATES])
+def test_first_question_carries_the_state_of_play() -> None:
+    question = wf.question_after_report(
+        [dict(c) for c in CANDIDATES], "🔴 failing: 2 of 3 DAG(s) failing"
+    )
     assert question is not None
     check_question(question)
-    assert question["question"] == "Which DAG should I diagnose?"
+    assert question["question"] == "🔴 failing: 2 of 3 DAG(s) failing\nWhich DAG should I diagnose?"
     assert question["choices"] == [
         "demo_train_critical",
         "demo_fetch_transient",
         "All (2)",
         "Stop here",
     ]
-    assert 'dag_ids=["demo_train_critical"]' in question["options"][0]["then"]
-    assert question["options"][0]["description"].startswith("recommended")
     assert wf.question_after_report([]) is None
 
 
-def test_many_dags_are_grouped_to_fit_four_choices() -> None:
-    many = [{**CANDIDATES[0], "dag_id": f"crit_{n}"} for n in range(3)] + [
-        {**CANDIDATES[1], "dag_id": f"tr_{n}"} for n in range(5)
-    ]
-    question = wf.question_after_report(many)
-    assert question is not None
-    check_question(question)
-    assert question["choices"] == ["crit_0", "All critical (3)", "All (8)", "Stop here"]
-    assert "typed_answers" in question
-
-
-def test_question_after_the_plan() -> None:
-    question = wf.question_after_plan(planned_audit())
-    assert question is not None
-    check_question(question)
-    assert question["choices"][0].startswith("1.1 train — KeyError")
-    assert question["choices"][2] == "All of DAG 1 (2)"
-    assert question["choices"][-1] == wf.STOP_LABEL
-
-
-@pytest.mark.parametrize(
-    ("state", "kind", "expected"),
-    [
-        ("fix_proposed", "code_fix", "Test fix 1.1 in the sandbox?"),
-        ("sandbox_passed", "code_fix", "Fix 1.1 passed the sandbox test. Apply it to your file?"),
-        ("sandbox_failed", "code_fix", "The sandbox test of fix 1.1 failed."),
-    ],
-)
-def test_a_question_between_each_step(state: str, kind: str, expected: str) -> None:
-    audit = planned_audit()
-    item = audit.item("1.1")
-    assert item is not None
-    item.state = state
-    step = wf.next_step(audit, item, sandbox_enabled=True)
-    check_question(step["next_question"])
-    assert step["next_question"]["question"] == expected
-    assert step["next_question"]["choices"][-1] == wf.STOP_LABEL
-
-
-def test_new_code_fix_starts_with_an_instruction_not_a_question() -> None:
+def test_a_code_error_is_proposed_and_tested_never_edited() -> None:
     audit = planned_audit()
     step = wf.next_step(audit, audit.item("1.1"), sandbox_enabled=True)
-    assert "airflow_get_dag_source" in step["next_action"]
-    assert "Do not edit any file" in step["next_action"]
+    action = step["next_action"]
+    assert "airflow_get_dag_source" in action and "airflow_sandbox_test" in action
+    assert 'level="structure"' in action
+    assert "Never edit a file during an audit" in action
 
 
-def test_transient_item_asks_for_a_dry_run_retry() -> None:
+def test_without_sandbox_the_fix_is_shown_and_skipped() -> None:
     audit = planned_audit()
-    step = wf.next_step(audit, audit.item("2.1"), sandbox_enabled=True)
-    question = step["next_question"]
+    action = wf.next_step(audit, audit.item("1.1"), sandbox_enabled=False)["next_action"]
+    assert 'state="skipped"' in action and "not tested (sandbox disabled)" in action
+
+
+def test_a_transient_failure_is_tested_by_a_real_retry() -> None:
+    audit = planned_audit()
+    question = wf.next_step(audit, audit.item("2.1"), sandbox_enabled=True)["next_question"]
     check_question(question)
     assert question["choices"][0] == "Preview the retry (dry run)"
     assert "dry_run=true" in question["options"][0]["then"]
+    set_state(audit, "retried", "2.1")
+    action = wf.next_step(audit, audit.item("2.1"), sandbox_enabled=True)["next_action"]
+    assert "airflow_get_run_status" in action and 'state="passed"' in action
 
 
-def test_sandbox_disabled_offers_no_test() -> None:
-    audit = planned_audit()
-    item = audit.item("1.1")
-    assert item is not None
-    item.state = "fix_proposed"
-    question = wf.next_step(audit, item, sandbox_enabled=False)["next_question"]
-    assert "Test it (copy, no network)" not in question["choices"]
-
-
-def test_what_next_after_a_closed_item() -> None:
-    """Same menu as after the diagnosis: the problems left, then Stop here."""
-    audit = planned_audit()
-    item = audit.item("1.1")
-    assert item is not None
-    item.state = "verified"
-    question = wf.next_step(audit, None, sandbox_enabled=True)["next_question"]
-    check_question(question)
-    assert question["question"] == "What next? Problems left:"
-    assert question["choices"] == [
-        "1.2 run — run marked success: a final task's trigger_rule hides the failure",
-        "2.1 fetch — ConnectionResetError: [Errno 104] Connection reset",
-        "Stop here",
-    ]
-
-
-# ---------------------------------------------------------------------------- retry gate
-# User request: no retry of a DAG while another error on the same DAG is still to fix;
-# show the problems left with the same menu as after the diagnosis instead.
-
-
-def applied(audit: wf.Audit, *numbers: str) -> None:
-    for number in numbers:
-        item = audit.item(number)
-        assert item is not None
-        item.state = "applied"
-
-
-def two_crashes() -> wf.Audit:
-    """demo_train_critical with two tasks that crash (1.1 train, 1.2 load) + the masking 1.3."""
-    audit = wf.create_audit("all", "24h", [dict(c) for c in CANDIDATES], None)
-    diagnosis = critical_diagnosis()
-    diagnosis["root_failures"].append(root("load", "critical", "ValueError: bad schema"))
-    audit.items += wf.items_from_diagnosis(audit, diagnosis)
-    audit.items += wf.items_from_diagnosis(audit, transient_diagnosis())
-    return audit
-
-
-def test_no_retry_while_another_task_of_the_dag_crashes() -> None:
-    audit = two_crashes()
-    applied(audit, "1.1")  # 1.2 (load, same DAG) still crashes
-    question = wf.next_step(audit, audit.item("1.1"), sandbox_enabled=True)["next_question"]
-    check_question(question)
-    assert question["question"] == (
-        "Fix 1.1 is applied, but demo_train_critical still has 1 problem(s) to fix before a "
-        "retry can work. Which one next?"
-    )
-    assert not any("retry" in c.lower() for c in question["choices"])
-    assert question["choices"][0].startswith("1.2 load")
-    assert question["options"][0]["description"] == (
-        "recommended, same DAG: needed before the retry"
-    )
-    assert question["choices"][-1] == wf.STOP_LABEL
-
-
-def test_the_masking_trigger_rule_does_not_block_the_retry() -> None:
-    """User rule: only errors that make a task fail block the retry; 1.2 (all_done hiding the
-    failure) stays on the list."""
-    audit = planned_audit()
-    applied(audit, "1.1")  # 1.2 is the masking item, still to do
-    question = wf.next_step(audit, audit.item("1.1"), sandbox_enabled=True)["next_question"]
-    check_question(question)
-    assert question["choices"][0] == "Preview the retry of demo_train_critical (dry run)"
-    assert question["choices"][1].startswith("1.2 run")  # still offered, not blocking
-
-
-def test_retry_offered_once_the_dag_is_clean_with_the_other_problems() -> None:
-    audit = planned_audit()
-    applied(audit, "1.1", "1.2")
-    question = wf.next_step(audit, audit.item("1.2"), sandbox_enabled=True)["next_question"]
-    check_question(question)
-    assert question["choices"][0] == "Preview the retry of demo_train_critical (dry run)"
-    assert 'task_ids=["train"]' in question["options"][0]["then"]
-    assert question["choices"][1].startswith("2.1 fetch")  # other DAG still listed
-    assert question["choices"][-1] == wf.STOP_LABEL
-
-
-def test_retry_when_nothing_else_is_left() -> None:
-    audit = planned_audit(both=False)
-    applied(audit, "1.1", "1.2")
-    question = wf.next_step(audit, audit.item("1.1"), sandbox_enabled=True)["next_question"]
-    assert question["question"] == (
-        "Fix 1.1 is applied. Retry the failed tasks of demo_train_critical?"
-    )
-    assert question["choices"] == [
-        "Preview the retry of demo_train_critical (dry run)",
-        "Not now",
-        "Stop here",
-    ]
-
-
-def test_transient_retry_waits_for_the_code_fixes_of_its_dag() -> None:
+def test_no_retry_on_a_dag_that_has_a_code_error() -> None:
+    """User rule: never run a DAG with a code error; and no code change during an audit."""
     audit = wf.create_audit("all", "24h", [dict(CANDIDATES[0])], None)
     diagnosis = critical_diagnosis()
     diagnosis["root_failures"].append(root("fetch", "transient", "ConnectionResetError: x"))
@@ -343,51 +206,121 @@ def test_transient_retry_waits_for_the_code_fixes_of_its_dag() -> None:
     fetch = next(i for i in audit.items if i.task_id == "fetch")
     question = wf.next_step(audit, fetch, sandbox_enabled=True)["next_question"]
     check_question(question)
-    assert question["question"].startswith(f"{fetch.number}: fetch can only be retried once")
+    assert "cannot be retried during the audit" in question["question"]
     assert not any("retry" in c.lower() for c in question["choices"])
 
 
-def test_what_next_puts_a_ready_retry_first() -> None:
+def test_after_a_passing_test_the_problems_left_are_offered() -> None:
+    """User request: a test works and problems are left → offer them, or Stop here."""
     audit = planned_audit()
-    applied(audit, "1.1", "1.2")
-    question = wf.question_what_next(audit)
-    assert question["choices"][0] == "Preview the retry of demo_train_critical (dry run)"
+    set_state(audit, "passed", "1.1")
+    question = wf.next_step(audit, audit.item("1.1"), sandbox_enabled=True)["next_question"]
+    check_question(question)
+    assert question["question"].startswith("✅ 1.1 works")
+    assert question["choices"][0].startswith("1.2 run")
     assert question["choices"][1].startswith("2.1 fetch")
 
 
-def test_everything_done_ends_with_the_summary() -> None:
+def test_everything_tested_ends_the_audit() -> None:
     audit = planned_audit()
-    for item in audit.items:
-        item.state = "verified"
-    step = wf.next_step(audit, None, sandbox_enabled=True)
-    assert 'state="stop"' in step["next_action"]
+    set_state(audit, "passed", "1.1", "1.2", "2.1")
+    step = wf.next_step(audit, audit.item("2.1"), sandbox_enabled=True)
+    assert step["finished"] is True and 'state="stop"' in step["next_action"]
+
+
+def test_a_failed_test_offers_revise_next_or_stop() -> None:
+    audit = planned_audit()
+    set_state(audit, "failed", "1.1")
+    question = wf.next_step(audit, audit.item("1.1"), sandbox_enabled=True)["next_question"]
+    check_question(question)
+    assert question["question"] == "❌ 1.1: the sandbox test failed. What now?"
+    assert question["choices"][0] == "Revise the fix"
+    assert question["choices"][1].startswith("Next problem: 1.2")
+
+
+def test_a_failed_retry_cannot_be_revised_in_the_audit() -> None:
+    audit = planned_audit()
+    set_state(audit, "failed", "2.1")
+    question = wf.next_step(audit, audit.item("2.1"), sandbox_enabled=True)["next_question"]
+    assert "probably not transient" in question["question"]
+    assert "Revise the fix" not in question["choices"]
+
+
+def test_masking_fix_asks_first() -> None:
+    audit = planned_audit()
+    set_state(audit, "passed", "1.1")
+    warning = {"file": "d.py", "line": 5, "why": "a missing key no longer fails"}
+    question = wf.question_masking(audit, audit.item("1.1"), [warning])  # type: ignore[arg-type]
+    check_question(question)
+    assert "may hide the error" in question["question"] and "d.py:5" in question["question"]
+    assert question["choices"][:2] == ["Revise the fix", "Keep it and go on"]
 
 
 # ---------------------------------------------------------------------------- summaries
 
 
-def test_stop_summary_lists_what_is_left() -> None:
-    audit = planned_audit(both=False)
+def test_archive_summary_lists_results_and_tested_patches() -> None:
+    audit = planned_audit()
     item = audit.item("1.1")
     assert item is not None
-    item.state = "verified"
+    item.state, item.result = "passed", {"level": "structure", "apply": "git -C d apply x.patch"}
+    set_state(audit, "failed", "1.2")
+    audit.status = wf.AUDIT_ARCHIVED
     text = wf.stop_summary(audit)
-    assert "1/2 done" in text
-    assert "Done: 1.1 (verified)" in text
-    assert "Left: 1.2 run (new)" in text
-    assert "Not diagnosed: demo_fetch_transient" in text
-    assert "Resume any time with /airflow-audit." in text
+    assert text.startswith(f"🗂️ Audit #{audit.id} archived.")
+    assert "✅ 1.1 train — KeyError: 'target' — fix tested in the sandbox" in text
+    assert "apply it on request: git -C d apply x.patch" in text
+    assert "❌ 1.2" in text and "• 2.1" in text
+    assert "No code was changed during the audit" in text
 
 
-def test_context_reminder_is_short_and_only_where_it_matters() -> None:
+def test_context_open_vs_archived() -> None:
     audit = planned_audit()
-    text = wf.context_summary(audit)
-    assert text.startswith(f"[airflow-mlops audit #{audit.id} — open")
-    assert "1.1 train (critical, code_fix) new" in text
-    assert len(text) <= 1200
+    open_text = wf.context_summary(audit)
+    assert "in progress" in open_text and "no code change during an audit" in open_text
+    assert "never overrides an explicit request" in open_text
     now = audit.updated_at
-    assert wf.context_is_relevant(audit, "s-1", now=now + 10_000)  # its own session
-    assert wf.context_is_relevant(audit, "other", now=now + 60)  # right after activity
-    assert not wf.context_is_relevant(audit, "other", now=now + 10_000)
-    audit.status = wf.AUDIT_STOPPED
-    assert not wf.context_is_relevant(audit, "s-1", now=now)
+    # an open audit reminds its own conversation only (not another chat, not a scheduled job)
+    assert wf.context_is_relevant(audit, "s-1", now=now + 60)
+    assert not wf.context_is_relevant(audit, "other", now=now + 60)
+    audit.status = wf.AUDIT_ARCHIVED
+    archived_text = wf.context_summary(audit)
+    assert "archived" in archived_text and "tested patch" in archived_text
+    # an archived audit only informs its own conversation
+    assert wf.context_is_relevant(audit, "s-1", now=now + 60)
+    assert not wf.context_is_relevant(audit, "other", now=now + 60)
+    assert not wf.context_is_relevant(audit, "s-1", now=now + 4 * 3600)
+
+
+# ---------------------------------------------------------------------------- after the audit
+
+
+def passed_fix(audit: wf.Audit, number: str, apply: str) -> None:
+    item = audit.item(number)
+    assert item is not None
+    item.state, item.result = "passed", {"level": "structure", "apply": apply}
+
+
+def test_leaving_with_tested_fixes_offers_to_apply_them() -> None:
+    """User request: at the final 'Stop here', offer to ask Hermes to apply the tested fixes."""
+    audit = planned_audit()
+    passed_fix(audit, "1.1", "git -C d apply a.patch")
+    passed_fix(audit, "1.2", "git -C d apply a.patch")  # tested together: the same patch
+    audit.status = wf.AUDIT_ARCHIVED
+    question = wf.question_apply(audit)
+    assert question is not None
+    assert question["question"] == (
+        f"✅ Audit #{audit.id} archived. Ask Hermes to apply the tested fixes 1.1 + 1.2 now?"
+    )
+    assert question["choices"] == ["Apply 1.1 + 1.2 (your approval required)", "Not now"]
+    then = question["options"][0]["then"]
+    assert then.count("git -C d apply a.patch") == 1  # one patch, applied once
+    assert "lock" in then and "dry run first" in then
+    assert question["options"][1]["kind"] == "done"
+
+
+def test_no_apply_question_without_a_tested_fix() -> None:
+    audit = planned_audit()
+    set_state(audit, "passed", "2.1")  # a retry that worked: nothing to apply
+    set_state(audit, "failed", "1.1")
+    assert wf.question_apply(audit) is None

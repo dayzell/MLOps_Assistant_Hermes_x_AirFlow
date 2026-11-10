@@ -16,7 +16,7 @@ from typing import Any
 
 from .airflow_client import AirflowClient, AirflowError
 from .config import Settings
-from .redaction import redact_text
+from .redaction import redact_code
 
 MAX_SOURCE_LINES = 600
 MAX_SOURCE_CHARS = 60_000
@@ -94,7 +94,7 @@ def read_dag_source(
         kept = content[:MAX_SOURCE_CHARS].rsplit("\n", 1)[0]
         last = first + kept.count("\n")
         content, truncated = kept, True
-    masked = redact_text(content)
+    masked = redact_code(content)
 
     result: dict[str, Any] = {
         "dag_id": dag_id,

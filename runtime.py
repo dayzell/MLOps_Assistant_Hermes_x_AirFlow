@@ -59,18 +59,21 @@ class PluginRuntime:
 
     def client(self, settings: Settings | None = None) -> AirflowClient:
         settings = settings or self.settings()
-        key = settings.connection_key()
+        credentials = load_credentials()
+        # A changed secret (new password or token) gets a new client: the key holds a digest
+        # of the credentials, never the values.
+        key = (*settings.connection_key(), settings.page_size, credentials.digest())
         with self._lock:
             if self._client_key != key:
                 self.reset_client()
                 self._client_key = key
-        client: AirflowClient = self._client_slot.get(
-            lambda: AirflowClient(settings, load_credentials())
-        )
+        client: AirflowClient = self._client_slot.get(lambda: AirflowClient(settings, credentials))
         return client
 
     def dispatch(self, tool_name: str, args: dict[str, Any]) -> str:
-        """Run another Hermes tool through Hermes' normal approval and redaction pipeline."""
+        """Run another Hermes tool directly (``ctx.dispatch_tool``). The tool's own checks
+        apply (the terminal's dangerous-command guards); plugin ``pre_tool_call`` hooks do not:
+        callers gate the call themselves."""
         dispatch_tool = getattr(self._ctx, "dispatch_tool", None)
         if dispatch_tool is None:
             raise RuntimeError("this Hermes context cannot dispatch tools")

@@ -1,19 +1,24 @@
-"""Guided audit (plan v2, step 1): the ``airflow_audit_*`` tools, ``/airflow-audit``,
-``/airflow-status`` and the dossier reminder given to the model before each reply.
+"""Guided audit: the ``airflow_audit_*`` tools, ``/airflow-audit``, ``/airflow-status`` and the
+dossier reminder given to the model before each reply.
 
+Rule: an audit never changes code. Report → diagnosis → test of each proposal (a real retry
+for a transient failure, a sandbox test for a code fix) → leaving the audit archives it.
 The dossier lives in ``plugin_db`` (see :mod:`workflow`). The plugin decides every question;
-the model displays it with Hermes' ``clarify`` tool and reports each step back.
+the model writes it at the end of its reply (numbered text) and reports each step back.
 """
 
 from __future__ import annotations
 
 import logging
 import re
-from pathlib import Path
+import time
+from datetime import UTC, datetime
 from typing import Any
 
+from . import storage
 from . import workflow as wf
 from .diagnosis import RunDiagnoser, load_rules
+from .display import FAIL, STATUS_ICONS
 from .runtime import PluginRuntime
 from .tools import (
     Handler,
@@ -21,6 +26,7 @@ from .tools import (
     ToolInputError,
     _check_allowed,
     _context_str,
+    _optional_int,
     _optional_str_list,
     ok,
     parse_command_args,
@@ -30,16 +36,11 @@ from .tools import (
 logger = logging.getLogger(__name__)
 
 MAX_DAGS_PER_PLAN = 10
-# Surfaces that print command output in a terminal (ANSI colors work there).
-TERMINAL_SURFACES = frozenset({"cli", "tui", "local"})
-YELLOW_BOLD = "\x1b[1;33m"
-RESET = "\x1b[0m"
-GO = "➡️ {label}: ready. Send any message (e.g. {go}) and the agent continues from here."
 _RUNS_SCANNED = 10
 
 
 class AuditTools:
-    """``airflow_audit_plan`` / ``airflow_audit_select`` / ``airflow_audit_progress``."""
+    """``airflow_audit_plan`` / ``_select`` / ``_progress`` / ``_timeline``."""
 
     def __init__(self, runtime: PluginRuntime, reads: ReadTools) -> None:
         self.runtime = runtime
@@ -51,6 +52,7 @@ class AuditTools:
             "airflow_audit_plan": safe_handler(self.plan, context_aware=True),
             "airflow_audit_select": safe_handler(self.select, context_aware=True),
             "airflow_audit_progress": safe_handler(self.progress, context_aware=True),
+            "airflow_audit_timeline": safe_handler(self.timeline),
         }
 
     # ------------------------------------------------------------------ tools
@@ -59,24 +61,22 @@ class AuditTools:
         dag_ids = _optional_str_list(args, "dag_ids")
         session_id = _context_str(context, "session_id")
         audit = wf.load_current()
-        if audit is None:
-            audit = wf.create_audit("selected", self._period(), [], session_id)
-        audit.status, audit.session_id = wf.AUDIT_OPEN, session_id or audit.session_id
         if not dag_ids:
-            if not audit.items and not audit.candidates:
+            if audit is None:
                 raise ToolInputError(
-                    "'dag_ids' is required (no audit in progress): list the DAGs to diagnose, "
-                    "or build a report first."
+                    "No audit in progress. Start one with /airflow-audit (report first), or "
+                    "give dag_ids to diagnose."
                 )
-            if not audit.items:  # a report was made, nothing diagnosed yet
-                wf.save_audit(audit)
+            if not audit.items:  # report made, nothing diagnosed yet
                 return ok(
                     **audit.to_dict(),
                     candidates=audit.candidates,
                     next_question=wf.question_after_report(audit.unplanned_candidates()),
                 )
-            wf.save_audit(audit)
             return ok(**self._state(audit, wf.question_after_plan(audit)))
+        if audit is None:
+            audit = wf.create_audit("selected", self._period(), [], session_id)
+        audit.session_id = session_id or audit.session_id
         notes = self._plan_dags(audit, dag_ids)
         audit.pending = None
         wf.save_audit(audit)
@@ -100,13 +100,14 @@ class AuditTools:
         if to_plan:
             notes = self._plan_dags(audit, to_plan)
             numbers += [i.number for d in to_plan for i in audit.items_of(d) if i.is_open]
+        numbers = [n for n in numbers if (i := audit.item(n)) is not None and i.is_open]
         if not numbers:
-            raise ToolInputError(f"Nothing left to handle in {selection!r}. " + " ".join(notes))
+            raise ToolInputError(f"Nothing left to test in {selection!r}. " + " ".join(notes))
         chosen = set(numbers)
         for entry in audit.items:
             entry.selected = entry.number in chosen
         audit.current = numbers[0]
-        audit.status, audit.pending = wf.AUDIT_OPEN, None
+        audit.pending = None
         audit.session_id = session_id or audit.session_id
         wf.save_audit(audit)
         item = audit.item(numbers[0])
@@ -123,52 +124,69 @@ class AuditTools:
 
     def progress(self, args: dict[str, Any], **context: Any) -> str:
         state = args.get("state")
+        audit = self._require_audit()
         if state == "stop":
-            audit = self._require_audit()
-            audit.status, audit.pending = wf.AUDIT_STOPPED, None
-            wf.save_audit(audit)
-            self.board.show(audit, "stopped", final=True)
-            return ok(stopped=True, summary=wf.stop_summary(audit), progress=audit.progress())
+            return ok(**self.archive(audit))
         if state not in wf.PROGRESS_STATES:
             raise ToolInputError(f"'state' must be one of {sorted(wf.PROGRESS_STATES)} or 'stop'.")
         raw = args.get("item")
         if not isinstance(raw, str) or not raw.strip():
             raise ToolInputError("'item' is required (e.g. '1.2', or '1.1, 1.2' for a group).")
-        audit = self._require_audit()
-        numbers = [n for n in re.split(r"[\s,;+]+", raw.strip()) if n]
+        numbers = _split(raw)
         items = [audit.item(n) for n in numbers]
         missing = [n for n, i in zip(numbers, items, strict=True) if i is None]
         if missing:
             raise ToolInputError(f"No item {', '.join(missing)} in audit #{audit.id}.")
         note = args.get("note")
         ts = self.runtime.now().timestamp()
-        for item in items:
-            assert item is not None
+        found = [i for i in items if i is not None]
+        for item in found:
             item.state = str(state)
             if isinstance(note, str) and note.strip():
                 item.note = note.strip()
             item.updated_at = ts
-            if state == "verified":  # one run check verifies every item retried with it
-                for other in audit.items:
-                    if other.dag_id == item.dag_id and other.state == "retried":
-                        other.state, other.updated_at = "verified", ts
-        first = items[0]
-        assert first is not None
-        audit.status = wf.AUDIT_OPEN
-        follow: wf.Item | None = first
-        if not first.is_open:
-            following = audit.open_items()
-            audit.current = following[0].number if following and following[0].selected else None
-            follow = None  # ask "What next?"
-        else:
-            audit.current = first.number
+        first = found[0]
+        audit.current = first.number if first.is_open else None
         wf.save_audit(audit)
         self.board.show(audit, f"{', '.join(numbers)}: {wf.STATE_TEXT[str(state)]}")
+        return ok(**self._after(audit, first, items=[i.to_dict() for i in found]))
+
+    def timeline(self, args: dict[str, Any]) -> str:
+        """Facts for a postmortem: the dossier and the journal of its DAGs, in time order."""
+        audit_id = _optional_int(args, "audit_id", None, 1)
+        audit = wf.load_audit(audit_id)
+        if audit is None:
+            raise ToolInputError("No audit found: run /airflow-audit first.")
+        dags = sorted({i.dag_id for i in audit.items} | {c["dag_id"] for c in audit.candidates})
+        journal = storage.list_audit_entries(audit.created_at - 6 * 3600, dag_ids=dags, limit=300)
+        events = [
+            {
+                "at": _iso(e["ts"]),
+                "what": _event_label(e),
+                "dag_id": e["dag_id"],
+                "run_id": e["run_id"],
+                "tasks": e["task_ids"],
+                "outcome": e["outcome"],
+                "reason": e["reason"],
+                "approval": "auto policy"
+                if e["auto"]
+                else ("preview" if e["dry_run"] else "human"),
+            }
+            for e in reversed(journal)
+        ]
+        items = [{**i.to_dict(), "updated_at": _iso(i.updated_at)} for i in audit.ordered_items()]
         return ok(
-            item=first.to_dict(),
-            items=[i.to_dict() for i in items if i is not None],
+            audit_id=audit.id,
+            status=audit.status,
+            scope=audit.scope,
+            period=audit.period,
+            started_at=_iso(audit.created_at),
+            last_update=_iso(audit.updated_at),
             progress=audit.progress(),
-            **wf.next_step(audit, follow, sandbox_enabled=self._sandbox_enabled()),
+            plan_text=wf.plan_text(audit),
+            items=items,
+            events=events,
+            note="Facts only: use them as they are, never invent a time, a cause or an approval.",
         )
 
     # ------------------------------------------------------------------ observers
@@ -177,7 +195,7 @@ class AuditTools:
         """Before a sandbox run: show what is being tested on the board; never raises."""
         try:
             audit = wf.load_current()
-            if audit is None or audit.status != wf.AUDIT_OPEN:
+            if audit is None:
                 return
             item = self._code_item(audit, dag_id, task_id)
             if item is not None:
@@ -189,11 +207,10 @@ class AuditTools:
     def observe_sandbox(
         self, dag_id: str, task_id: str | None, level: str, result: dict[str, Any]
     ) -> dict[str, Any] | None:
-        """Record a sandbox test on the matching code fix (or its whole group, tested in one
-        run); never raises."""
+        """The sandbox test IS the test of a code fix: record passed / failed; never raises."""
         try:
             audit = wf.load_current()
-            if audit is None or audit.status != wf.AUDIT_OPEN:
+            if audit is None:
                 return None
             item = self._code_item(audit, dag_id, task_id)
             if item is None:
@@ -202,28 +219,36 @@ class AuditTools:
             numbers = [i.number for i in group]
             passed = bool(result.get("passed"))
             if passed and level == "import":
-                for member in group:
-                    member.note = "sandbox: import passed"
-                wf.save_audit(audit)
                 self.board.show(audit, f"{', '.join(numbers)}: import passed")
                 return {
                     "items": numbers,
-                    "state": item.state,
-                    "next_action": "Import passed: now test level='structure'.",
+                    "next_action": "Import passed: now test level='structure' (same diff).",
                 }
             ts = self.runtime.now().timestamp()
+            commands = result.get("apply_commands") or {}
             for member in group:
-                member.state = "sandbox_passed" if passed else "sandbox_failed"
-                member.note = f"sandbox {level}: {'passed' if passed else 'failed'}"
+                member.state = "passed" if passed else "failed"
                 member.updated_at = ts
-            audit.current = item.number
+                member.note = f"sandbox {level}: {'passed' if passed else 'failed'}"
+                if passed:
+                    member.result = {
+                        "level": level,
+                        "patch_file": result.get("patch_file"),
+                        "apply": commands.get("apply"),
+                        "check": commands.get("check"),
+                        "undo": commands.get("undo"),
+                    }
+            audit.current = None
             wf.save_audit(audit)
             self.board.show(audit, f"{', '.join(numbers)}: {wf.STATE_TEXT[item.state]}")
-            return {
-                "items": numbers,
-                "state": item.state,
-                **wf.next_step(audit, item, sandbox_enabled=True),
-            }
+            warnings = result.get("masking_warnings") or []
+            if passed and warnings:  # loads fine, but may hide the error: say it first
+                return {
+                    "items": numbers,
+                    "state": item.state,
+                    "next_question": wf.question_masking(audit, item, warnings),
+                }
+            return {"items": numbers, "state": item.state, **self._after(audit, item)}
         except Exception:
             logger.warning("airflow-mlops: could not record the sandbox test", exc_info=True)
             return None
@@ -231,19 +256,17 @@ class AuditTools:
     def observe_clear(
         self, dag_id: str, task_ids: list[str], result: dict[str, Any]
     ) -> dict[str, Any] | None:
-        """Mark the matching items as retried after a real clear; never raises."""
+        """A real retry of a transient failure: the item waits for the run check."""
         try:
             if result.get("outcome") != "cleared":
                 return None
             audit = wf.load_current()
-            if audit is None or audit.status != wf.AUDIT_OPEN:
+            if audit is None:
                 return None
             items = [
                 i
                 for i in audit.items
-                if i.dag_id == dag_id
-                and i.is_open
-                and (i.task_id in task_ids or (i.task_id is None and i.state == "applied"))
+                if i.dag_id == dag_id and i.kind == "retry" and i.is_open and i.task_id in task_ids
             ]
             if not items:
                 return None
@@ -262,30 +285,11 @@ class AuditTools:
             logger.warning("airflow-mlops: could not record the retry", exc_info=True)
             return None
 
-    def observe_applied(self, dag_id: str, paths: list[str]) -> None:
-        """A sandbox-tested fix was written to the DAG file: its items become 'applied'."""
-        try:
-            audit = wf.load_current()
-            if audit is None or audit.status != wf.AUDIT_OPEN:
-                return
-            items = [i for i in audit.items if i.dag_id == dag_id and i.state == "sandbox_passed"]
-            if not items:
-                return
-            ts = self.runtime.now().timestamp()
-            for item in items:
-                item.state, item.updated_at = "applied", ts
-                item.note = "written: " + ", ".join(Path(p).name for p in paths)
-            audit.current = items[0].number
-            wf.save_audit(audit)
-            numbers = ", ".join(i.number for i in items)
-            self.board.show(audit, f"{numbers}: applied to the file")
-        except Exception:
-            logger.warning("airflow-mlops: could not record the applied fix", exc_info=True)
-
     def context(self, session_id: str | None) -> str | None:
-        """Dossier reminder for ``pre_llm_call``; never raises."""
+        """Reminder for ``pre_llm_call``: the audit in progress, or the results of the last
+        archived one in the same conversation; never raises."""
         try:
-            audit = wf.load_current()
+            audit = wf.load_current() or wf.load_audit()
             if audit is None or not wf.context_is_relevant(audit, session_id):
                 return None
             return wf.context_summary(audit)
@@ -293,7 +297,46 @@ class AuditTools:
             logger.warning("airflow-mlops: could not read the audit", exc_info=True)
             return None
 
+    def audit_in_progress(self, session_id: str | None = None) -> bool:
+        """For the DAG write lock: no code change during an audit. The audit locks its own
+        conversation until it ends, and every other one while it is active (30 min): a
+        forgotten audit no longer blocks DAG writes for a day."""
+        try:
+            audit = wf.load_current()
+            if audit is None:
+                return False
+            if session_id and audit.session_id and session_id == audit.session_id:
+                return True
+            return time.time() - audit.updated_at <= wf.CONTEXT_ACTIVE_SECONDS
+        except Exception:
+            return True  # cannot tell: keep the lock (a human can still end the audit)
+
     # ------------------------------------------------------------------ helpers
+
+    def _after(self, audit: wf.Audit, item: wf.Item, **extra: Any) -> dict[str, Any]:
+        """Next step after a change; leaving the audit when everything is tested."""
+        step = wf.next_step(audit, item, sandbox_enabled=self._sandbox_enabled())
+        payload = {"item": item.to_dict(), "progress": audit.progress(), **extra}
+        if step.get("finished"):
+            return {**payload, **self.archive(audit)}
+        return {**payload, **step}
+
+    def archive(self, audit: wf.Audit) -> dict[str, Any]:
+        audit.status, audit.pending, audit.current = wf.AUDIT_ARCHIVED, None, None
+        wf.save_audit(audit)
+        self.board.show(audit, "archived", final=True)
+        result: dict[str, Any] = {
+            "archived": True,
+            "summary": wf.stop_summary(audit),
+            "progress": audit.progress(),
+        }
+        question = wf.question_apply(audit)
+        if question:  # fixes passed their test: offer to have Hermes apply them
+            result["next_question"] = question
+            result["next_action"] = "Show the summary, then end your reply with next_question."
+        else:
+            result["next_action"] = "Show the summary. The audit is over: no question to ask."
+        return result
 
     def _plan_dags(self, audit: wf.Audit, dag_ids: list[str]) -> list[str]:
         settings = self.runtime.settings()
@@ -345,15 +388,15 @@ class AuditTools:
     def _require_audit(self) -> wf.Audit:
         audit = wf.load_current()
         if audit is None:
-            raise ToolInputError("No audit in progress: call airflow_audit_plan with dag_ids.")
+            raise ToolInputError("No audit in progress: start one with /airflow-audit.")
         return audit
 
     def _state(self, audit: wf.Audit, question: dict[str, Any] | None) -> dict[str, Any]:
         state = {**audit.to_dict(), "plan_text": wf.plan_text(audit)}
         if question:
             state["next_question"] = question
-        elif audit.unplanned_candidates() or audit.items:
-            state["next_question"] = wf.question_what_next(audit)
+        elif audit.has_work_left():
+            state["next_question"] = wf.question_remaining(audit, "What next?")
         return state
 
     def _period(self) -> str:
@@ -398,49 +441,54 @@ class ProgressBoard:
 class AuditCommands:
     """``/airflow-audit [scope] [period]`` and ``/airflow-status``.
 
-    The command runs the deterministic steps itself (diagnose and number, select, stop,
-    resume), menu after menu, until a step needs the model; then it saves what to do and the
-    user sends a message ("go"). Nothing is sent to the model behind the user's back: a turn
-    started by a plugin runs unseen in Hermes v0.23 and can wait forever on a question.
+    The command answers at once: the report, then the first question as numbered text. It
+    never waits for a menu, never calls the model and never posts a separate message: clients
+    give up on a slash command after a deadline (Hermes Desktop: 30 s, then they run it a
+    second time), and in a command Hermes cannot tell a Desktop from a terminal. The user's
+    reply starts a normal turn: the model continues with the ``airflow_audit_*`` tools.
+
+    Every ``/airflow-audit`` starts a new audit from the report (an audit left open is
+    archived: no resume).
     """
 
-    MAX_MENUS = 6
-
-    def __init__(self, ctx: Any, reads: ReadTools, audits: AuditTools) -> None:
-        self._ctx = ctx
+    def __init__(self, reads: ReadTools, audits: AuditTools) -> None:
         self.reads = reads
         self.audits = audits
 
     def audit(self, raw_args: str = "", **kwargs: Any) -> str:
-        session_id = _session(kwargs)
-        current = wf.load_current()
-        if current is not None and not (raw_args or "").strip() and _resumable(current):
-            return self._resume(current, session_id, kwargs)
         scope, period = parse_command_args(raw_args)
         try:
-            report = self.reads._report(scope, period, True)
+            report = self.reads.report(scope, period, update_baseline=True)
         except Exception as exc:  # report errors become plain text, like /airflow-report
             message = getattr(exc, "message", None) or str(exc)
-            return f"❌ /airflow-audit: {message}"
+            return f"{FAIL} /airflow-audit: {message}"
+        health = report["report"]["health"]
         candidates = wf.candidates_from_report(report["report"])
         audit = wf.create_audit(
-            scope, report["report"]["scope_period"]["period"], candidates, session_id
+            scope, report["report"]["scope_period"]["period"], candidates, _session(kwargs)
         )
         markdown = str(report["markdown"])
-        lines = [] if self._post(markdown) else [markdown]
-        question = wf.question_after_report(candidates)
+        state_of_play = (
+            f"{STATUS_ICONS.get(health['status'], '')} {health['status']}: "
+            f"{health['status_reason']}"
+        )
+        question = wf.question_after_report(candidates, state_of_play)
         if question is None:
-            audit.status = wf.AUDIT_DONE
-            wf.save_audit(audit)
-            return _join([*lines, "No incident in this period: nothing to diagnose."])
-        return self._drive(audit, question, kwargs, lines)
+            self.audits.archive(audit)
+            return _join([markdown, "No incident in this period: nothing to diagnose."])
+        audit.pending = wf.pending_question(question)  # the model reads it in its reminder
+        wf.save_audit(audit)
+        return _join([markdown, text_question(question)])
 
     def status(self, raw_args: str = "", **kwargs: Any) -> str:
         audit = wf.load_current()
         if audit is None:
-            return "No audit in progress. Start one with /airflow-audit."
+            last = wf.load_audit()
+            if last is None:
+                return "No audit yet. Start one with /airflow-audit."
+            return "No audit in progress. Last one:\n" + wf.stop_summary(last)
         lines = [
-            f"Audit #{audit.id} — {audit.status} — scope {audit.scope} {audit.period}",
+            f"Audit #{audit.id} — in progress — scope {audit.scope} {audit.period}",
             audit.progress()["line"],
         ]
         if audit.items:
@@ -450,145 +498,20 @@ class AuditCommands:
             lines += ["", "Not diagnosed yet: " + ", ".join(c["dag_id"] for c in unplanned)]
         return "\n".join(lines)
 
-    # ------------------------------------------------------------------ the menus
 
-    def _resume(self, audit: wf.Audit, session_id: str | None, kwargs: dict[str, Any]) -> str:
-        left = len(audit.open_items()) + len(audit.unplanned_candidates())
-        question = wf.make_question(
-            f"Resume audit #{audit.id} ({left} left)?",
-            [
-                wf.option(
-                    f"Resume ({left} left)",
-                    "Call airflow_audit_plan with no arguments and ask the question it returns.",
-                    audit.progress()["line"],
-                    kind="resume",
-                ),
-                wf.option("New audit", "Run /airflow-audit all 24h.", kind="new"),
-                wf.stop_option(),
-            ],
-        )
-        audit.session_id = session_id or audit.session_id
-        audit.status = wf.AUDIT_OPEN
-        wf.save_audit(audit)
-        return self._drive(audit, question, kwargs, [])
+def _iso(ts: float) -> str:
+    return datetime.fromtimestamp(ts, UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
-    def _drive(
-        self,
-        audit: wf.Audit,
-        question: dict[str, Any],
-        kwargs: dict[str, Any],
-        lines: list[str],
-    ) -> str:
-        for _ in range(self.MAX_MENUS):
-            picked = self._ask(question)
-            if picked is None:  # no menu on this surface: the model gets the question as context
-                audit.pending = {"label": "(not answered yet)", "then": question["question"]}
-                wf.save_audit(audit)
-                return _join([*lines, text_question(question)])
-            kind = picked.get("kind", "model")
-            if kind == "stop":
-                audit.status, audit.pending = wf.AUDIT_STOPPED, None
-                wf.save_audit(audit)
-                self.audits.board.show(audit, "stopped", final=True)
-                return _join([*lines, wf.stop_summary(audit)])
-            if kind == "new":
-                audit.status = wf.AUDIT_SUPERSEDED
-                wf.save_audit(audit)
-                return _join([*lines, self.audit("all", **kwargs)])
-            if kind == "model":  # the agent must do this step (retry preview, code...)
-                audit.pending = {"label": picked["label"], "then": picked["then"]}
-                wf.save_audit(audit)
-                return _join([*lines, self._go(picked["label"], kwargs)])
-            try:
-                following = self._run_here(audit, picked, kwargs, lines)
-            except Exception as exc:  # Airflow down, DAG not allowed...: say it, keep the audit
-                message = getattr(exc, "message", None) or str(exc)
-                return _join([*lines, f"❌ {picked['label']}: {message}"])
-            if following is None:  # the next step needs the model
-                return _join(lines)
-            question = following
-            refreshed = wf.load_current()
-            audit = refreshed if refreshed is not None else audit
-        return _join([*lines, "Send any message to go on."])
 
-    def _run_here(
-        self,
-        audit: wf.Audit,
-        picked: dict[str, str],
-        kwargs: dict[str, Any],
-        lines: list[str],
-    ) -> dict[str, Any] | None:
-        """Run one deterministic step in the command; the next question, or None when the
-        model must take over (then the pending instruction is saved and explained)."""
-        kind, value = picked["kind"], picked.get("value", "")
-        if kind == "resume":
-            lines.append(self.status())
-            if audit.open_items():
-                return wf.question_after_plan(audit)
-            return wf.question_after_report(audit.unplanned_candidates())
-        if kind == "plan":
-            notes = self.audits._plan_dags(audit, [d for d in value.split(",") if d])
-            audit.pending = None
-            wf.save_audit(audit)
-            lines.append(wf.plan_text(audit))
-            lines += notes
-            return wf.question_after_plan(audit) or wf.question_what_next(audit)
-        # select
-        step = self.audits._select_core(audit, value, _session(kwargs))
-        lines.append(f"➡️ {picked['label']} — {step['progress']['line']}")
-        if step.get("next_question"):
-            return dict(step["next_question"])
-        refreshed = wf.load_current() or audit
-        refreshed.pending = {"label": picked["label"], "then": str(step.get("next_action"))}
-        wf.save_audit(refreshed)
-        lines.append(self._go(picked["label"], kwargs))
-        return None
-
-    # ------------------------------------------------------------------ Hermes features
-
-    def _go(self, label: str, kwargs: dict[str, Any]) -> str:
-        """The "send 'go'" line, with 'go' in bold yellow in a terminal (ANSI) and in bold
-        Markdown elsewhere (Desktop, messaging), so it cannot be missed."""
-        surface = ""
-        getter = getattr(self._ctx, "session_surface", None)
-        try:
-            surface = str(getter() or "") if getter is not None else ""
-        except Exception:
-            surface = ""
-        platform = str(kwargs.get("platform") or "")
-        logger.info("airflow-mlops: /airflow-audit surface=%r platform=%r", surface, platform)
-        terminal = surface in TERMINAL_SURFACES or (not surface and platform in TERMINAL_SURFACES)
-        word = f"{YELLOW_BOLD}'go'{RESET}" if terminal else "**'go'**"
-        return GO.format(label=label, go=word)
-
-    def _ask(self, question: dict[str, Any]) -> dict[str, str] | None:
-        ask = getattr(self._ctx, "ask_choice", None)
-        if ask is None:
-            return None
-        choices = [
-            {
-                "value": o["label"],
-                "label": o["label"],
-                **({"description": o["description"]} if o.get("description") else {}),
-            }
-            for o in question["options"]
-        ]
-        try:
-            answer = ask(question["question"], choices)
-        except Exception:
-            logger.warning("airflow-mlops: ask_choice failed", exc_info=True)
-            return None
-        return next((o for o in question["options"] if o["label"] == answer), None)
-
-    def _post(self, text: str) -> bool:
-        post = getattr(self._ctx, "post_message", None)
-        if post is None:
-            return False
-        try:
-            return bool(getattr(post(text), "ok", False))
-        except Exception:
-            logger.warning("airflow-mlops: post_message failed", exc_info=True)
-            return False
+def _event_label(entry: dict[str, Any]) -> str:
+    tool = entry["tool"]
+    if tool == "airflow_sandbox_test":
+        return f"sandbox test ({entry['reason'] or 'level ?'})"
+    if tool == "dag_write":
+        return f"DAG file written: {entry['reason']}"
+    if tool == "airflow_clear_tasks":
+        return "retry preview" if entry["dry_run"] else "retry"
+    return str(tool)
 
 
 def _join(parts: list[str]) -> str:
@@ -605,10 +528,10 @@ def text_question(question: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def _split(value: str) -> list[str]:
+    return [n for n in re.split(r"[\s,;+]+", value or "") if n]
+
+
 def _session(kwargs: dict[str, Any]) -> str | None:
     value = kwargs.get("session_id") or kwargs.get("session_key")
     return str(value) if value else None
-
-
-def _resumable(audit: wf.Audit) -> bool:
-    return bool(audit.open_items() or audit.unplanned_candidates())

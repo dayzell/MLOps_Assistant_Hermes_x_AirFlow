@@ -1,7 +1,8 @@
-"""Icons used in the plugin's pre-made answers, kept in one place.
+"""Icons of the plugin's answers, in one place.
 
-The final display pass (plan v2, section 7: option B, colored check / cross) will restyle the
-answers here only.
+The answers use emoji (the user's choice): ✅ healthy / passed, 🟠 degraded, 🔴 failing,
+⚪ no data, ⚠️ warning, ❌ failed, ℹ️ information. No terminal color code anywhere: in a
+slash command Hermes cannot tell a terminal from the Desktop app.
 """
 
 from __future__ import annotations
@@ -11,9 +12,8 @@ SEVERITY_ICONS = {"high": "🔴", "medium": "🟠", "low": "🟡", "info": "ℹ�
 OK = "✅"
 FAIL = "❌"
 WARN = "⚠️"
-INFO = "ℹ️"
 NEXT = "➡️"
-PAUSE = "⏸"
 WORKING = "⏳"
 WAITING = "•"
 LATER = "⏸"
+ARCHIVE = "🗂️"

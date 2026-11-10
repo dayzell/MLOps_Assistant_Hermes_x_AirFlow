@@ -12,7 +12,7 @@ How it works:
   ``execute_code`` commands that write in the DAGs folder) compares the content the call would
   produce with the tested one: same content → human approval; untested or different → blocked,
   with the command that applies the tested patch;
-* ``post_tool_call`` checks the file once written and moves the audit item to ``applied``.
+* ``post_tool_call`` checks the file once written and journals whether it is the tested change.
 
 Fingerprints ignore line endings (CRLF / LF) and trailing blank lines only.
 """
@@ -35,10 +35,17 @@ from .config import Settings
 
 logger = logging.getLogger(__name__)
 
-GUARD_MODES = ("sandbox_required", "approval_only", "off")
 FILE_TOOLS = frozenset({"write_file", "patch"})
 SHELL_TOOLS = frozenset({"terminal", "execute_code"})
 TESTED_TTL_SECONDS = 7 * 24 * 3600
+# A DAG file is written only once the change passed at least these levels ("import" alone
+# only proves that the file loads, not that tasks and dependencies are unchanged).
+PROVEN_LEVELS = frozenset({"structure", "task"})
+AUDIT_BLOCK = (
+    "BLOCKED by airflow-mlops: an audit is in progress, and an audit never changes code "
+    "(report, diagnosis, test only). Finish it ('Stop here' archives it); the fix tested in "
+    "the sandbox can then be applied, after the user's approval."
+)
 _V4A_HEADER = re.compile(r"^\*\*\*\s*(?:Update|Add|Delete|Move) File:\s*(.+?)\s*$", re.M)
 _GIT_APPLY = re.compile(r"\bgit\b[^\n;&|]*?\bapply\b([^\n;&|]*)")
 _WRITE_HINTS = re.compile(
@@ -61,8 +68,9 @@ def fingerprint(content: str | bytes) -> str:
 
 
 def path_key(path: str | Path) -> str:
-    """Comparable absolute path (case-insensitive on Windows, forward slashes)."""
-    return os.path.normcase(os.path.abspath(os.path.expanduser(str(path)))).replace("\\", "/")
+    """Comparable real path (links resolved, case-insensitive on Windows, forward slashes):
+    a write through a symbolic link to the DAGs folder is a write in the DAGs folder."""
+    return os.path.normcase(os.path.realpath(os.path.expanduser(str(path)))).replace("\\", "/")
 
 
 @dataclass(frozen=True)
@@ -152,11 +160,18 @@ class DagWriteGuard:
         self,
         settings_provider: Callable[[], Settings],
         cwd_provider: Callable[[], str] | None = None,
-        on_applied: Callable[[str, list[str]], None] | None = None,
+        audit_in_progress: Callable[[str | None], bool] | None = None,
     ) -> None:
         self._settings = settings_provider
         self._cwd = cwd_provider or os.getcwd
-        self.on_applied = on_applied
+        self._audit_in_progress = audit_in_progress
+
+    def _busy(self, session_id: str | None) -> bool:
+        """An airflow-mlops audit is in progress: no code change until it is over."""
+        try:
+            return bool(self._audit_in_progress and self._audit_in_progress(session_id))
+        except Exception:
+            return False
 
     # ------------------------------------------------------------------ setup
 
@@ -189,7 +204,9 @@ class DagWriteGuard:
 
     # ------------------------------------------------------------------ pre_tool_call
 
-    def decide(self, tool_name: str, args: dict[str, Any]) -> dict[str, Any] | None:
+    def decide(
+        self, tool_name: str, args: dict[str, Any], session_id: str | None = None
+    ) -> dict[str, Any] | None:
         if tool_name not in FILE_TOOLS | SHELL_TOOLS:
             return None
         root, mode = self._root()
@@ -197,11 +214,16 @@ class DagWriteGuard:
             return None
         if tool_name in SHELL_TOOLS:
             text = str(args.get("command") if tool_name == "terminal" else args.get("code") or "")
-            return self._decide_shell(text, root, mode)
+            decision = self._decide_shell(text, root, mode)
+            if decision is not None and self._busy(session_id):
+                return {"action": "block", "message": AUDIT_BLOCK}
+            return decision
         targets = self._file_targets(tool_name, args)
         inside = [(path, result) for path, result in targets if self._inside(path, root)]
         if not inside:
             return None
+        if self._busy(session_id):
+            return {"action": "block", "message": AUDIT_BLOCK}
         names = ", ".join(Path(p).name for p, _ in inside)
         if mode == "approval_only":
             return _approve(
@@ -257,12 +279,19 @@ class DagWriteGuard:
                 f"tested in the sandbox. {apply_hint}"
             )
         produced = fingerprint(result)
-        match = next((t for t in tests if t.after == produced), None)
-        if match is None:
+        matches = [t for t in tests if t.after == produced]
+        if not matches:
             return (
                 f"BLOCKED by airflow-mlops: this change of {name} differs from the one that "
                 f"passed the sandbox at {latest.when}. Test this exact change again with "
                 f"airflow_sandbox_test, or apply the tested one. {apply_hint}"
+            )
+        match = next((t for t in matches if t.level in PROVEN_LEVELS), None)
+        if match is None:
+            return (
+                f"BLOCKED by airflow-mlops: this change of {name} only passed the "
+                f"'{matches[0].level}' level. Run airflow_sandbox_test with the same diff and "
+                "level='structure' (tasks and dependencies checked) before it can be written."
             )
         current = _read(path)
         if (
@@ -282,7 +311,9 @@ class DagWriteGuard:
 
     def _decide_shell(self, text: str, root: str, mode: str) -> dict[str, Any] | None:
         normalized = text.replace("\\", "/")
-        lowered = normalized.lower()
+        # The command concerns the DAGs folder when it names it, or when it runs from inside
+        # it (relative paths: ``sed -i ... x.py``, ``git apply fix.patch``).
+        touches_root = root.lower() in normalized.lower() or self._inside(self._abs("."), root)
         apply = _GIT_APPLY.search(normalized)
         if apply:
             options = apply.group(1)
@@ -291,6 +322,14 @@ class DagWriteGuard:
             patch = _patch_argument(options)
             tests = tested_changes(patch_file=patch) if patch else []
             if tests:
+                unproven = [t for t in tests if not _proven(t)]
+                if unproven and not _reverse(options) and mode == "sandbox_required":
+                    return {
+                        "action": "block",
+                        "message": f"BLOCKED by airflow-mlops: this patch only passed the "
+                        f"'{unproven[0].level}' level. Run airflow_sandbox_test with "
+                        "level='structure' first, then apply the patch it saves.",
+                    }
                 stale = [t for t in tests if not _still_applies(t, reverse=_reverse(options))]
                 if stale and mode == "sandbox_required":
                     return {
@@ -305,13 +344,13 @@ class DagWriteGuard:
                     f"tested at {tests[0].when}).",
                     f"dag_patch:{fingerprint(tests[0].patch_file)[:12]}:{verb.lower()}",
                 )
-            if root.lower() in lowered and mode == "sandbox_required":
+            if touches_root and mode == "sandbox_required":
                 return {
                     "action": "block",
                     "message": "BLOCKED by airflow-mlops: this patch was not tested in the "
                     "sandbox. Test it with airflow_sandbox_test first.",
                 }
-        if root.lower() in lowered and _WRITE_HINTS.search(normalized):
+        if touches_root and _WRITE_HINTS.search(normalized):
             return _approve(
                 "This command may change files of the DAGs folder; airflow-mlops cannot check "
                 "it against a sandbox test. Approve only if you know what it does.",
@@ -322,7 +361,7 @@ class DagWriteGuard:
     # ------------------------------------------------------------------ post_tool_call
 
     def after(self, tool_name: str, args: dict[str, Any], result: Any = None) -> None:
-        """Once a DAG file is written: journal it and record the fix as applied."""
+        """Once a DAG file is written: journal whether it is the tested change."""
         try:
             root, _ = self._root()
             if root is None:
@@ -358,8 +397,16 @@ class DagWriteGuard:
             reason=Path(path).name,
             outcome="matches_tested_fix" if match else "differs_from_tested_fix",
         )
-        if match and self.on_applied is not None:
-            self.on_applied(match.dag_id, [path])
+
+
+def _proven(test: TestedChange) -> bool:
+    """The same change (same file, same result) passed at least the 'structure' level, in
+    this run or another one (each sandbox run saves its own patch file)."""
+    if test.level in PROVEN_LEVELS:
+        return True
+    return any(
+        t.after == test.after and t.level in PROVEN_LEVELS for t in tested_changes(test.path)
+    )
 
 
 def _approve(message: str, rule_key: str) -> dict[str, Any]:

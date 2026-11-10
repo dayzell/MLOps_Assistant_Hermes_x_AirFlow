@@ -1,0 +1,49 @@
+Crée une présentation de exactement 3 slides, en français, pour présenter brièvement un projet de hackathon à un jury technique (développeurs, data engineers, équipes MLOps).
+
+Style : sobre et moderne, fond sombre, une couleur d'accent bleue. Peu de texte : des phrases courtes, au plus 5 points par slide. Une icône simple par idée. Pas de photos génériques de personnes. Ne jamais inventer de chiffre : utiliser seulement ceux donnés ci-dessous.
+
+Titre de la présentation : « airflow-mlops — un assistant MLOps pour Apache Airflow, dans Hermes Agent »
+
+---
+
+SLIDE 1 — Le problème et la solution
+
+Titre : « Quand un pipeline casse, on perd du temps à comprendre pourquoi »
+
+Le problème :
+- Un DAG Airflow échoue : il faut fouiller les logs, les XComs et les dépendances pour trouver la vraie cause.
+- Certains échecs sont cachés : un run marqué « success » peut contenir une tâche en échec, masquée par une tâche finale en trigger_rule « all_done ».
+- Relancer « pour voir » fait perdre du temps et peut cacher l'erreur.
+
+La solution : airflow-mlops, un plugin pour Hermes Agent (l'agent IA open source de Nous Research) qui le transforme en assistant MLOps pour Apache Airflow. Il se connecte à l'API REST d'Airflow 2.x et 3.x.
+
+Visuel suggéré : schéma simple en trois blocs reliés par des flèches : « Utilisateur » → « Hermes Agent + plugin airflow-mlops » → « API REST Airflow ».
+
+---
+
+SLIDE 2 — Ce que fait le plugin
+
+Titre : « Surveiller, diagnostiquer, corriger, en gardant la main »
+
+Présenter en 4 cartes (une icône par carte) :
+1. Surveiller : rapport de monitoring normé, toujours les mêmes 6 sections (périmètre, santé, performance par tâche, qualité des données, incidents, recommandations). Surveillance planifiée de nuit qui n'alerte que sur ce qui est nouveau.
+2. Diagnostiquer : trouve la tâche racine de la panne, extrait le bloc d'erreur et classe l'erreur en « transitoire » ou « critique » avec sa justification. Détecte les échecs cachés.
+3. Corriger sans risque : chaque correctif proposé est testé dans un bac à sable Docker jetable (copie des DAGs, sans réseau, sans secrets) avant d'être proposé.
+4. Audit guidé : la commande /airflow-audit enchaîne rapport → diagnostic numéroté (1.1, 1.2…) → test de chaque proposition, avec une question entre chaque étape et « Stop here » toujours possible.
+
+Ligne en bas de slide : « 18 outils · 7 skills · 3 hooks · commandes /airflow-report, /airflow-audit, /airflow-status »
+
+---
+
+SLIDE 3 — Sécurité et qualité
+
+Titre : « Rien ne change sans validation humaine »
+
+Points :
+- Lecture seule par défaut. Une relance ne vise que les tâches en échec, jamais le DAG entier, avec un aperçu (dry run) avant toute action.
+- Verrou sur les fichiers de DAG : seul le changement exact qui a réussi le test en bac à sable peut être écrit, et seulement après validation humaine.
+- Secrets masqués dans tout ce que voit le modèle (logs, XComs, paramètres) ; allowlist des DAGs autorisés ; journal de chaque action (qui, quoi, quand, pourquoi).
+- Détection des « faux correctifs » qui cachent l'erreur au lieu de la corriger (par exemple remplacer frame["target"] par frame.get("target")).
+- Qualité : 496 tests automatisés, ruff et mypy strict sans erreur, validé par « hermes plugins validate » et « hermes plugins doctor ». Testé sur Airflow 2.9.3 et 3.4.0 avec Hermes v0.23.
+
+Phrase de conclusion en grand, en bas de la slide : « L'agent propose et teste ; l'humain décide. »

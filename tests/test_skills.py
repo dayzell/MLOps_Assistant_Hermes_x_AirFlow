@@ -8,7 +8,15 @@ import pytest
 import yaml
 from harness import ROOT, make_context
 
-EXPECTED = ("airflow-triage", "airflow-report", "airflow-fix-proposal", "airflow-audit")
+EXPECTED = (
+    "airflow-triage",
+    "airflow-report",
+    "airflow-fix-proposal",
+    "airflow-audit",
+    "airflow-dag-review",
+    "airflow-watch",
+    "airflow-postmortem",
+)
 
 
 def _split(text: str) -> tuple[dict[str, object], str]:
@@ -62,7 +70,7 @@ def test_fix_procedure_stops_after_the_sandbox_and_hands_over() -> None:
     assert "even if a file or terminal tool is available" not in body
     assert "apply_commands.check" in body  # applying it yourself stays possible
     report = (ROOT / "skills" / "airflow-report" / "SKILL.md").read_text(encoding="utf-8")
-    assert "Do not diagnose before the user has chosen" in report
+    assert "Do not call any tool after the report" in report
 
 
 def test_several_problems_are_presented_as_a_numbered_plan() -> None:

@@ -202,6 +202,40 @@ AIRFLOW_GET_DAG_SOURCE: dict[str, Any] = {
     },
 }
 
+AIRFLOW_REVIEW_DAG: dict[str, Any] = {
+    "name": "airflow_review_dag",
+    "description": (
+        "Review a DAG before deploying it: reads its code and tasks and reports, with the exact "
+        "line, a final trigger_rule that hides failures (all_done...), a secret written in the "
+        "code, heavy work at the top level of the file, swallowed exceptions, tasks without "
+        "retries, catchup=True. Read-only; heuristics, not a proof."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {"dag_id": _DAG_ID},
+        "required": ["dag_id"],
+    },
+}
+
+AIRFLOW_WATCH_CHECK: dict[str, Any] = {
+    "name": "airflow_watch_check",
+    "description": (
+        "Scheduled watch: compare the latest run of every allowed DAG with the previous check "
+        "and return only what is new (failed run, failure hidden by a final all_done task, DAG "
+        "back to green), with silent=true when nothing changed. Read-only for Airflow."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "reset": {
+                "type": "boolean",
+                "description": "Forget what was already reported (report every incident again).",
+            }
+        },
+        "required": [],
+    },
+}
+
 AIRFLOW_DIAGNOSE_RUN: dict[str, Any] = {
     "name": "airflow_diagnose_run",
     "description": (
@@ -263,6 +297,8 @@ READ_TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
         AIRFLOW_GET_XCOMS,
         AIRFLOW_GET_DEPENDENCIES,
         AIRFLOW_GET_DAG_SOURCE,
+        AIRFLOW_REVIEW_DAG,
+        AIRFLOW_WATCH_CHECK,
         AIRFLOW_DIAGNOSE_RUN,
         AIRFLOW_BUILD_REPORT,
     )
@@ -376,8 +412,8 @@ AIRFLOW_AUDIT_PLAN: dict[str, Any] = {
     "description": (
         "Guided audit: diagnose the latest failing run of each listed DAG and build the "
         "numbered plan (DAG 1 -> 1.1, 1.2...; numbers stay the same for the whole audit). "
-        "Returns plan_text and next_question (ask it with the clarify tool, options as given). "
-        "Without dag_ids, returns the audit in progress (to resume it). Never changes Airflow."
+        "Returns plan_text and next_question (write it at the end of your reply, as given). "
+        "Without dag_ids, returns the audit in progress. Never changes Airflow or code."
     ),
     "parameters": {
         "type": "object",
@@ -412,11 +448,12 @@ AIRFLOW_AUDIT_SELECT: dict[str, Any] = {
 AIRFLOW_AUDIT_PROGRESS: dict[str, Any] = {
     "name": "airflow_audit_progress",
     "description": (
-        "Guided audit: record a step on an item and get the next question. States: "
-        "fix_proposed (fix shown), sandbox_passed / sandbox_failed (usually recorded "
-        "automatically by airflow_sandbox_test), applied (the user's file now has the fix), "
-        "retried, verified (run OK), skipped, deferred (later). state='stop' ends the audit "
-        "('Stop here') and returns a summary; the audit can be resumed with /airflow-audit."
+        "Guided audit (never changes code): record a step and get the next question. States: "
+        "fix_proposed (fix shown, to test in the sandbox), retried, passed (test OK: sandbox "
+        "structure passed, or the retried run succeeded), failed (test failed), skipped. Sandbox "
+        "results and real retries are recorded automatically. state='stop' ('Stop here') "
+        "archives the audit and returns its summary; when everything is tested the audit is "
+        "archived by itself."
     ),
     "parameters": {
         "type": "object",
@@ -428,17 +465,7 @@ AIRFLOW_AUDIT_PROGRESS: dict[str, Any] = {
             },
             "state": {
                 "type": "string",
-                "enum": [
-                    "fix_proposed",
-                    "sandbox_passed",
-                    "sandbox_failed",
-                    "applied",
-                    "retried",
-                    "verified",
-                    "skipped",
-                    "deferred",
-                    "stop",
-                ],
+                "enum": ["fix_proposed", "retried", "passed", "failed", "skipped", "stop"],
             },
             "note": {"type": "string", "description": "Optional short note."},
         },
@@ -446,7 +473,28 @@ AIRFLOW_AUDIT_PROGRESS: dict[str, Any] = {
     },
 }
 
+AIRFLOW_AUDIT_TIMELINE: dict[str, Any] = {
+    "name": "airflow_audit_timeline",
+    "description": (
+        "Facts for an incident postmortem: the audit dossier (numbered problems and their "
+        "states) and the plugin's journal for its DAGs in time order (sandbox tests, DAG files "
+        "written, retries, who approved). Default: the latest audit. Read-only."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "audit_id": {"type": "integer", "minimum": 1, "description": "Audit number."},
+        },
+        "required": [],
+    },
+}
+
 AUDIT_TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
     schema["name"]: schema
-    for schema in (AIRFLOW_AUDIT_PLAN, AIRFLOW_AUDIT_SELECT, AIRFLOW_AUDIT_PROGRESS)
+    for schema in (
+        AIRFLOW_AUDIT_PLAN,
+        AIRFLOW_AUDIT_SELECT,
+        AIRFLOW_AUDIT_PROGRESS,
+        AIRFLOW_AUDIT_TIMELINE,
+    )
 }

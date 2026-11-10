@@ -183,36 +183,70 @@ def test_guard_errors_fall_back_to_a_human(dags: Path, monkeypatch: pytest.Monke
 # ---------------------------------------------------------------------------- after the write
 
 
-def test_written_fix_is_journaled_and_moves_the_audit_item(dags: Path) -> None:
+def test_written_fix_is_journaled(dags: Path) -> None:
+    """After the audit, Hermes applies the tested fix: the write is checked and journaled."""
     ctx = sandbox_ctx(dags)
     record_fix(dags)
-    audit = wf.create_audit("all", "24h", [], "s-1")
-    audit.items.append(
-        wf.Item("1.1", 1, 1, "train", "r", "train", "critical", "code_fix", "t", "sandbox_passed")
-    )
-    audit.candidates.append({"dag_id": "train", "status": "failing", "reason": "x"})
-    wf.save_audit(audit)
-
     (dags / "train.py").write_text(FIXED, encoding="utf-8")  # what Hermes wrote
     ctx.hooks["post_tool_call"][0](
         tool_name="write_file", args={"path": str(dags / "train.py"), "content": FIXED}
     )
     entries = storage.list_audit_entries(0.0, dag_ids=["train"])
     assert entries[0]["tool"] == "dag_write" and entries[0]["outcome"] == "matches_tested_fix"
-    current = wf.load_current()
-    assert current is not None and current.item("1.1").state == "applied"  # type: ignore[union-attr]
+
+
+def test_no_code_change_during_an_audit(dags: Path) -> None:
+    """User rule: an audit never changes code, not even a tested fix."""
+    ctx = sandbox_ctx(dags)
+    patch = Path(record_fix(dags)).as_posix()
+    wf.create_audit("all", "24h", [], "s-1")  # an audit in progress
+    write = hook(ctx, "write_file", path=str(dags / "train.py"), content=FIXED)
+    assert write is not None and write["action"] == "block"
+    assert "an audit is in progress" in write["message"]
+    apply = hook(ctx, "terminal", command=f"git -C {dags.as_posix()} apply {patch}")
+    assert apply is not None and apply["action"] == "block"
+    assert hook(ctx, "terminal", command=f"cat {dags.as_posix()}/train.py") is None  # reading
+    # once the audit is archived, the tested fix can be applied (with the user's approval)
+    ctx.call("airflow_audit_progress", state="stop")
+    after = hook(ctx, "write_file", path=str(dags / "train.py"), content=FIXED)
+    assert after is not None and after["action"] == "approve"
 
 
 def test_a_passing_sandbox_test_unlocks_its_change(dags: Path, api: Any) -> None:
+    """Real session: only the 'import' level ran and the lock let it through. Now the change
+    must pass 'structure' too (tasks and dependencies checked)."""
     ctx = sandbox_ctx(dags)
     ctx.dispatch_handler = lambda tool, args: terminal(sentinel(True))
-    result = ctx.call("airflow_sandbox_test", dag_id="train", patch=PATCH)
+    result = ctx.call("airflow_sandbox_test", dag_id="train", patch=PATCH)  # level import
     assert result["passed"] is True
     recorded = recorded_changes(dags / "train.py")
     assert recorded and recorded[0].after == fingerprint(FIXED)
     assert recorded[0].before == fingerprint(BUGGY)
-    decision = hook(ctx, "write_file", path=str(dags / "train.py"), content=FIXED)
+    write = {"path": str(dags / "train.py"), "content": FIXED}
+    blocked = hook(ctx, "write_file", **write)
+    assert blocked is not None and blocked["action"] == "block"
+    assert "only passed the 'import' level" in blocked["message"]
+    import_patch = Path(result["patch_file"]).as_posix()
+    apply = hook(ctx, "terminal", command=f"git -C {dags.as_posix()} apply {import_patch}")
+    assert apply is not None and apply["action"] == "block"
+
+    ctx.call("airflow_sandbox_test", dag_id="train", patch=PATCH, level="structure")
+    decision = hook(ctx, "write_file", **write)
     assert decision is not None and decision["action"] == "approve"
+    # the patch saved by the import run is the same change: it may now be applied too
+    apply = hook(ctx, "terminal", command=f"git -C {dags.as_posix()} apply {import_patch}")
+    assert apply is not None and apply["action"] == "approve"
+
+
+def test_the_sandbox_flags_a_fix_that_hides_the_error(dags: Path, api: Any) -> None:
+    """User question: the .get() 'fix' passed the sandbox; the user should have been warned."""
+    ctx = sandbox_ctx(dags)
+    ctx.dispatch_handler = lambda tool, args: terminal(sentinel(True))
+    result = ctx.call("airflow_sandbox_test", dag_id="train", patch=PATCH)
+    warning = result["masking_warnings"][0]
+    assert warning["rule"] == "key_lookup_to_get" and warning["line"] == 5
+    assert "no longer fails" in warning["why"]
+    assert "masking_warnings" in result["note"]
 
 
 def test_a_failing_sandbox_test_unlocks_nothing(dags: Path, api: Any) -> None:

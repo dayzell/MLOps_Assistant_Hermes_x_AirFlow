@@ -269,6 +269,8 @@ def test_failed_import_is_reported(dags: Path, api: Any) -> None:
     assert result["ok"] is True and result["passed"] is False
     assert result["stages"]["import"]["import_errors"] == {"train.py": "SyntaxError"}
     assert storage.list_audit_entries(0)[0]["outcome"] == "failed"
+    # a failed patch is not kept: only patches that passed can be applied
+    assert not Path(result["patch_file"]).exists() and "apply_commands" not in result
 
 
 def test_task_level_with_fixtures(dags: Path, api: Any) -> None:

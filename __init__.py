@@ -6,6 +6,7 @@ network call (the Airflow client is created lazily on the first tool call).
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import Any
 
@@ -21,17 +22,21 @@ from .schemas import (
     WRITE_TOOL_SCHEMAS,
 )
 from .tools import ReadTools, SandboxTools, WriteTools
-from .ui_check import UiCheck
+from .watch import BLUEPRINT
 
 __all__ = ["register"]
 
+logger = logging.getLogger(__name__)
+
 SKILLS_DIR = Path(__file__).resolve().parent / "skills"
-SEPARATOR = "\n\n"
 SKILLS: dict[str, str] = {
     "airflow-triage": "Diagnose a failed Airflow run and propose the minimal remediation.",
     "airflow-report": "Standard six-section Airflow monitoring report, numbers never invented.",
     "airflow-fix-proposal": "Fix proposal for a critical Airflow failure (cause, diff, risks).",
     "airflow-audit": "Guided Airflow audit: report, numbered plan, a question between each step.",
+    "airflow-dag-review": "Review a DAG before deployment: trigger rules, secrets, parse work.",
+    "airflow-watch": "Scheduled watch: alerts only on new failures, hidden ones and recoveries.",
+    "airflow-postmortem": "Incident postmortem from the audit dossier and the plugin journal.",
 }
 
 
@@ -88,11 +93,13 @@ def register(ctx: Any) -> None:
 
     # Human approval for every real write unless the bounded auto-retry policy allows it,
     # and for sandbox tests above sandbox_max_level.
-    guard = DagWriteGuard(runtime.settings, _session_cwd(ctx), on_applied=audits.observe_applied)
+    guard = DagWriteGuard(
+        runtime.settings, _session_cwd(ctx), audit_in_progress=audits.audit_in_progress
+    )
     ctx.register_hook("pre_tool_call", make_pre_tool_call_hook(runtime.settings, guard))
 
     def post_tool_call(tool_name: str = "", args: Any = None, **kwargs: Any) -> None:
-        """After Hermes wrote a DAG file: journal it, move the audit item to 'applied'."""
+        """After Hermes wrote a DAG file: journal whether it is the tested change."""
         if tool_name in GUARDED_TOOLS and isinstance(args, dict):
             guard.after(tool_name, args, kwargs.get("result"))
 
@@ -105,11 +112,11 @@ def register(ctx: Any) -> None:
         args_hint="[all|<dag_id>|tag:<tag>] [24h|7d]",
     )
 
-    commands = AuditCommands(ctx, tools, audits)
+    commands = AuditCommands(tools, audits)
     ctx.register_command(
         "airflow-audit",
         commands.audit,
-        description="Guided Airflow audit: report, then a question between each step.",
+        description="Guided Airflow audit: the report, then the first question.",
         args_hint="[all|<dag_id>|tag:<tag>] [24h|7d]",
     )
     ctx.register_command(
@@ -118,21 +125,22 @@ def register(ctx: Any) -> None:
         description="Progress of the Airflow audit in progress (numbered plan).",
     )
 
-    # Plan v2, step 0: check which Hermes UI features work on the user's surface.
-    ui_check = UiCheck(ctx)
-    ctx.register_command(
-        "airflow-ui-check",
-        ui_check.command,
-        description="Check menus, progress bar and context on this Hermes surface.",
-    )
-
     def pre_llm_call(**kwargs: Any) -> dict[str, str] | None:
-        """Before each model reply: the audit dossier reminder (and the ui-check code)."""
-        probe = ui_check.pre_llm_call(**kwargs) or {}
-        parts = [p for p in (probe.get("context"), audits.context(kwargs.get("session_id"))) if p]
-        return {"context": SEPARATOR.join(parts)} if parts else None
+        """Before each model reply: the audit dossier reminder."""
+        context = audits.context(kwargs.get("session_id"))
+        return {"context": context} if context else None
 
     ctx.register_hook("pre_llm_call", pre_llm_call)
+
+    # A ready-made scheduled job in Hermes' gallery (/blueprint): the night watch. Optional:
+    # a Hermes without this API (or with another signature) must not break the plugin.
+    register_blueprint = getattr(ctx, "register_automation_blueprint", None)
+    if callable(register_blueprint):
+        spec = dict(BLUEPRINT)
+        try:
+            register_blueprint(spec.pop("key"), **spec)
+        except Exception:
+            logger.warning("airflow-mlops: night-watch blueprint not registered", exc_info=True)
 
     for name, description in SKILLS.items():
         ctx.register_skill(name, SKILLS_DIR / name / "SKILL.md", description=description)

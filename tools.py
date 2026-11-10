@@ -15,6 +15,7 @@ from typing import Any
 
 from .airflow_client import AirflowError
 from .config import DagNotAllowedError, Settings
+from .dag_review import review_dag
 from .dag_source import read_dag_source
 from .diagnosis import RunDiagnoser, load_rules
 from .display import FAIL
@@ -25,7 +26,7 @@ from .runtime import PluginRuntime
 from .sandbox import SandboxError, SandboxRequest, SandboxRunner
 from .textutils import excerpt_log, truncate_text, truncate_value
 from .views import build_dependency_view, collect_xcoms
-from .workflow import candidates_from_report, question_after_report
+from .watch import reset_watch_state, watch_check
 
 logger = logging.getLogger(__name__)
 
@@ -152,6 +153,8 @@ class ReadTools:
             "airflow_get_xcoms": safe_handler(self.get_xcoms),
             "airflow_get_dependencies": safe_handler(self.get_dependencies),
             "airflow_get_dag_source": safe_handler(self.get_dag_source),
+            "airflow_review_dag": safe_handler(self.review_dag),
+            "airflow_watch_check": safe_handler(self.watch_check),
             "airflow_diagnose_run": safe_handler(self.diagnose_run),
             "airflow_build_report": safe_handler(self.build_report),
         }
@@ -332,6 +335,22 @@ class ReadTools:
             raise ToolInputError(str(exc)) from exc
         return ok(**result)
 
+    # -- airflow_watch_check
+    def watch_check(self, args: dict[str, Any]) -> str:
+        settings = self.runtime.settings()
+        if _optional_bool(args, "reset"):
+            reset_watch_state()
+        return ok(**watch_check(self.runtime.client(settings), settings))
+
+    # -- airflow_review_dag
+    def review_dag(self, args: dict[str, Any]) -> str:
+        settings = self.runtime.settings()
+        dag_id = _require_str(args, "dag_id")
+        _check_allowed(settings, dag_id)
+        client = self.runtime.client(settings)
+        source = read_dag_source(client, settings, dag_id)
+        return ok(**review_dag(source, client.get_tasks(dag_id)))
+
     # -- airflow_diagnose_run
     def diagnose_run(self, args: dict[str, Any]) -> str:
         settings = self.runtime.settings()
@@ -350,13 +369,16 @@ class ReadTools:
         if not isinstance(scope, str) or (period is not None and not isinstance(period, str)):
             raise ToolInputError("'scope' and 'period' must be strings.")
         update_baseline = _optional_bool(args, "update_baseline")
-        result = self._report(scope, period, True if update_baseline is None else update_baseline)
-        question = question_after_report(candidates_from_report(result["report"]))
-        if question:
-            result["next_question"] = question
-        return ok(**result)
+        # The report is the whole answer: no question attached. A question here made the
+        # model call a menu before writing anything, so the report was never displayed.
+        return ok(
+            **self.report(
+                scope, period, update_baseline=True if update_baseline is None else update_baseline
+            )
+        )
 
-    def _report(self, scope: str, period: str | None, update_baseline: bool) -> dict[str, Any]:
+    def report(self, scope: str, period: str | None, *, update_baseline: bool) -> dict[str, Any]:
+        """The report as a dict (``report`` + ``markdown``); raises like any handler body."""
         settings = self.runtime.settings()
         try:  # validate before any network call
             parsed_scope = parse_scope(scope)

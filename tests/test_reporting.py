@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import time
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -277,7 +278,8 @@ def test_empty_scope_keeps_the_same_structure(
 def test_baseline_trend_and_update(
     api_version: str, airflow: respx.MockRouter, ctx: FakeContext
 ) -> None:
-    storage.update_baseline("train", "fit", p50=50.0, p95=60.0, samples=10)
+    two_hours_ago = time.time() - 7200
+    storage.update_baseline("train", "fit", p50=50.0, p95=60.0, samples=10, now=two_hours_ago)
     mock_airflow(airflow, api_version)
     report = ctx.call("airflow_build_report", scope="train", period="24h")["report"]
     fit = next(t for t in report["performance"]["tasks"] if t["task_id"] == "fit")
@@ -288,6 +290,9 @@ def test_baseline_trend_and_update(
     updated = storage.get_baselines("train")["fit"]
     assert updated.p50 == pytest.approx(0.7 * 50 + 0.3 * 100)
     assert updated.samples == 13
+    # the same report again within the hour (a re-run command) does not move the baseline
+    ctx.call("airflow_build_report", scope="train", period="24h")
+    assert storage.get_baselines("train")["fit"] == updated
 
 
 def test_update_baseline_false_leaves_baselines(
@@ -470,7 +475,7 @@ def test_one_recovered_dag_among_several_is_only_degraded(
     assert health["status"] == "degraded"
     assert health["status_reason"].startswith("1 DAG(s) degraded: a (1 incident(s)")
     assert "🟠 degraded" in result["markdown"]
-    assert "- Status: **degraded** — 1 DAG(s) degraded" in result["markdown"]
+    assert "- Status: **🟠 degraded** — 1 DAG(s) degraded" in result["markdown"]
 
 
 def test_section5_lists_each_run_under_its_own_heading(

@@ -4,24 +4,32 @@ Ce guide explique **ce que l'agent sait faire**, **les outils qu'il utilise** et
 que vous pouvez changer**, sans entrer dans le code. Pour les détails techniques, voir le
 [README](../README.md).
 
-> Version décrite : **0.6.0**.
+> Version décrite : **1.3.0**.
 
 ---
 
 ## 1. En bref
 
-Le plugin transforme l'agent Hermes en assistant pour **Apache Airflow**. Il sait faire cinq
-choses :
+Le plugin transforme l'agent Hermes en assistant pour **Apache Airflow**. Il sait faire :
 
-| Fonction | En une phrase | Modifie Airflow ? |
+| Fonction | En une phrase | Modifie quelque chose ? |
 |---|---|---|
 | 🔍 **Surveiller** | Lister les DAGs, leurs runs, leurs tâches, leurs logs | Non |
 | 🩺 **Diagnostiquer** | Trouver la tâche à l'origine d'une panne et dire si l'erreur est passagère ou grave | Non |
 | 📊 **Rapporter** | Produire un rapport de santé, toujours dans le même format | Non |
-| 🔁 **Relancer** | Relancer uniquement les tâches en échec, après votre accord | **Oui**, désactivé par défaut |
+| 🧭 **Audit guidé** | `/airflow-audit` : une question entre chaque étape (répondez par un numéro), `Stop here` toujours possible | Non, sauf ce que vous validez |
+| 🔁 **Relancer** | Relancer uniquement les tâches en échec, après votre accord | **Airflow**, désactivé par défaut |
 | 🧪 **Tester un correctif** | Essayer un correctif dans un conteneur Docker jetable avant de vous le proposer | Non, désactivé par défaut |
+| 🔒 **Verrou sur les DAGs** | Seul le changement exact qui a réussi le test peut être écrit dans un DAG, après votre validation | Vos fichiers, seulement après validation |
+| 🔎 **Revoir un DAG** | Avant déploiement : `all_done` qui cache les échecs, secret dans le code, retries… avec la ligne exacte | Non |
+| 🌙 **Surveillance de nuit** | Tâche planifiée « Airflow night watch » : un message seulement quand il y a du nouveau | Non (relance des erreurs passagères si vous l'autorisez) |
+| 📝 **Fiche bilan** | Postmortem d'un incident : chronologie, cause, correctif, qui a validé quoi | Non |
 
 **Par défaut, le plugin est en lecture seule** : il ne peut rien modifier dans Airflow.
+
+Les réponses du plugin utilisent les mêmes repères visuels : `✅ healthy`, `🟠 degraded`,
+`🔴 failing`, `⚠️` pour un avertissement. L'audit pose ses questions en liste numérotée :
+répondez par un numéro ou un nom.
 
 ---
 
@@ -64,33 +72,60 @@ Vous parlez normalement ; l'agent choisit les bons outils.
 | « Rapport de la semaine » ou `/airflow-report all 7d` | `airflow_build_report` |
 | « Relance la tâche en échec » | `airflow_clear_tasks` : aperçu d'abord, puis votre accord |
 | « Comment corriger cette erreur ? » | skill `airflow-fix-proposal` : le correctif (fichier, lignes, avant / après), puis l'offre de le tester dans le bac à sable |
-| « Applique le correctif » (après le test) | les outils de code habituels de Hermes ; ce n'est plus la procédure du plugin |
+| « Applique le correctif » (après le test) | `git apply` du patch testé : le **verrou** le laisse passer et Hermes vous demande de valider ; toute autre écriture dans un DAG non testée est bloquée |
 | « Vérifie que ton correctif marche » | `airflow_sandbox_test`, qui le teste dans le bac à sable |
 | « Qu'est-ce qui est cassé ? Corrige mes DAGs » | un **plan numéroté par DAG** (1.1, 1.2, 2.1…), avec une correction proposée pour chaque problème ; l'agent demande ensuite par lequel commencer |
+| « Relis mon DAG avant que je le déploie » | skill `airflow-dag-review` : `airflow_review_dag` (lignes exactes), puis correctifs testés |
+| « Surveille mes DAGs la nuit » ou `/blueprint` → « Airflow night watch » | skill `airflow-watch` : `airflow_watch_check`, silencieux quand rien ne change |
+| « Fais-moi le postmortem de l'incident » | skill `airflow-postmortem` : `airflow_audit_timeline` (dossier + journal) |
 
-**L'audit guidé : `/airflow-audit`** (une question à choix entre chaque étape)
+**L'audit guidé : `/airflow-audit`** — rapport → diagnostic → test, **sans jamais modifier le code**
 
 ```
 /airflow-audit
-→ rapport, puis : Which DAG should I diagnose?   [demo_train_critical] [demo_fetch_transient] [All (2)] [Stop here]
-→ plan numéroté, puis : Which problem first?      [1.1 train — KeyError 'target'] [1.2 …] [All of DAG 1 (2)] [Stop here]
-→ correctif montré, puis : Test fix 1.1 in the sandbox?   [Test it] [Show the raw diff] [Skip the test] [Stop here]
-→ test réussi, puis : Apply it to your file?       [Apply it (your approval required)] [I'll apply it myself] [Not now] [Stop here]
-→ relance (aperçu d'abord), vérification, puis : What next?   [Continue with 1.2] [Next DAG …] [Stop here]
+→ le rapport, puis : Which DAG should I diagnose?  1. demo_train_critical  2. demo_fetch_transient
+                     3. All (2)  4. Stop here                         vous : 1
+→ le diagnostic, puis : Which problem first?  1. 1.1 train — KeyError 'target'  2. …    vous : 1
+→ le correctif testé (fichier, lignes avant/après, bac à sable structure ✅), puis les problèmes
+  restants                                                              vous : stop
+→ 🗂️ Audit #7 archived — le bilan, puis : Apply 1.1 (your approval required) ?  vous : oui
 ```
 
-1. **État des lieux** : le rapport, puis le choix des DAGs à diagnostiquer. Rien n'est
-   diagnostiqué avant votre réponse.
-2. **Plan numéroté** (1.1, 1.2, 2.1…) : les numéros ne changent plus. Vous pouvez aussi taper
-   votre sélection : `1.1, 2.3`, `DAG 2`, `all critical`, `all except 2.1`.
-3. **Correctif, test, application, relance** : une question à chaque étape, l'option
-   recommandée en premier.
-4. **`Stop here`** à tout moment : un bilan s'affiche (fait, reste). `/airflow-audit` propose
-   ensuite de reprendre là où vous vous êtes arrêté ; `/airflow-status` montre où vous en êtes.
+1. **Rapport** : toujours en premier.
+2. **Diagnostic** des DAGs choisis : problèmes numérotés (1.1, 1.2, 2.1…).
+3. **Test de chaque proposition**, fait par l'agent :
+   - une erreur passagère est **relancée pour de vrai**, après un aperçu et votre accord ;
+   - une erreur de code reçoit un correctif **testé dans le bac à sable** (une copie). Si le
+     test échoue, « Revise the fix » demande un nouveau correctif. Après chaque test réussi, les problèmes restants vous sont proposés, ou `Stop here`.
+4. **Sortie** : l'audit est **archivé** (pas de reprise). Hermes garde le bilan dans la
+   conversation : dites ensuite « applique le correctif 1.1 », et il applique le patch testé,
+   après votre validation.
 
-Lancez Hermes avec `hermes chat -t airflow,file,terminal,clarify` : `clarify` affiche les
-questions sous forme de menu, `file` et `terminal` permettent à Hermes de modifier le code
-quand vous le lui demandez.
+Pendant l'audit, **aucun fichier de DAG ne peut être modifié** : le verrou le bloque.
+
+**Comment l'audit pose ses questions.** `/airflow-audit` répond tout de suite : le
+rapport, puis la première question en liste numérotée (« Which DAG should I diagnose? »). Il
+n'ouvre aucun menu, n'appelle pas le modèle et n'envoie pas de message à part. Répondez dans la
+conversation (un numéro, un nom de DAG, « stop ») : l'agent continue avec les outils
+`airflow_audit_*`, et chaque réponse de l'agent se termine par la question suivante du plugin,
+en texte.
+
+Pourquoi ce choix :
+
+- le Desktop abandonne une commande au bout de 30 s, puis la relance : une commande qui
+  attendait un menu tournait deux fois ;
+- dans une commande, Hermes ne distingue pas le Desktop d'un terminal (les deux sont la
+  surface `local`) ;
+- un modèle qui appelle un outil de menu (`clarify`) juste après son texte envoie souvent
+  l'appel seul : le texte restait dans son raisonnement et n'apparaissait pas.
+
+Dans un même tour, l'agent fait d'abord tous ses appels d'outils, puis écrit le résultat et la
+question. Le correctif d'une erreur de code est testé au niveau `structure` du bac à sable, qui
+comprend la vérification d'import.
+
+Lancez simplement `hermes chat` (ou l'application Desktop) : l'agent a les outils de fichiers
+et le terminal de Hermes, en plus des outils du plugin. L'option `-t airflow,file,terminal` ne
+sert qu'avec un petit modèle local, pour alléger le prompt.
 
 **Commande rapide :** `/airflow-report [périmètre] [période]`
 

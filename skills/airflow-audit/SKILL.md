@@ -1,7 +1,7 @@
 ---
 name: airflow-audit
-description: Run a guided Apache Airflow audit — state of play (report), then the user picks what to diagnose, then a numbered plan, a proposed fix, an optional sandbox test, the application and a targeted retry, with a multiple-choice question between every step and "Stop here" always possible. Use when the user runs /airflow-audit, asks to audit or check their Airflow, answers one of the audit questions, or an "[airflow-mlops audit ...]" reminder is in context.
-version: 0.9.0
+description: Run a guided Apache Airflow audit that never changes code — report first, then the diagnosis of the chosen DAGs as numbered problems, then the test of each proposal (a real retry for a transient failure, a fix tested in the sandbox for a code error), with a multiple-choice question between steps and "Stop here" always possible; leaving the audit archives it. Use when the user runs /airflow-audit, asks to audit or check their Airflow, answers one of the audit questions, or an "[airflow-mlops audit ...]" reminder is in context.
+version: 3.0.0
 author: Joseph Keita
 license: MIT
 metadata:
@@ -13,80 +13,88 @@ metadata:
 
 # Guided Airflow audit
 
-The plugin keeps a dossier of the audit (numbered items and their state) and decides every
-question. Your job: run each step, show the result, then **ask the plugin's question and
-wait**. Never skip a question, never invent options. Reply in the user's language; the
-plugin's own texts stay in English.
+**An audit never changes code.** It does three things, in this order:
+
+1. **Report** — the state of play.
+2. **Diagnosis** — the chosen DAGs, as numbered problems (1.1, 1.2, 2.1…).
+3. **Test of each proposal** — a transient failure is retried for real (the user approves);
+   a code error gets a fix tested in the sandbox (a copy: the user's files never change).
+
+After each test, the plugin offers the problems left, or "Stop here". Leaving the audit
+archives it (no resume). The tested fixes stay known: after the audit, if the user asks, the
+tested patch can be applied (the DAG write lock lets only that change through, with the
+user's approval). During the audit the lock blocks every write to a DAG file.
+
+`/airflow-audit` only prints the report and the first question ("Which DAG should I
+diagnose?") as numbered text, then stops. **You run every step after that**, with the
+`airflow_audit_*` tools. The plugin still decides every question; you run each step, show the
+result, then **end your reply with the plugin's question and wait**. Reply in the user's
+language; the plugin's texts stay in English.
 
 ## When to Use
 
-- The user runs `/airflow-audit`, or asks "audit my Airflow", "what is broken?", "check my DAGs".
-- The user sends a short message ("go") right after `/airflow-audit` printed
-  "ready. Send any message": do the pending step of the `[airflow-mlops audit …]` reminder.
-- An `[airflow-mlops audit #N …]` reminder is in your context and the user answers briefly
-  ("yes", "go", "2", "1.2", "stop"): it refers to the audit's last question.
+- The user asks "audit my Airflow", "what is broken?" (outside the slash command).
+- The user answers the question `/airflow-audit` printed (a number, a DAG name, "stop"): the
+  reminder lists each choice with what to do for it.
+- An `[airflow-mlops audit … in progress]` reminder is in context and the user answers
+  briefly ("yes", "2", "1.2", "stop").
+
+An explicit request of the user always comes first: the reminder only guides the audit.
 
 ## How to ask a question
 
 Tool results carry `next_question` (`question`, `choices`, `options`, `recommended`).
 
-1. Call the `clarify` tool with **exactly** `question` and `choices` (single select, the
-   recommended option first). If `clarify` is not available, write the choices as a numbered
-   list and wait for the answer.
-2. Find the chosen option in `options` and do its `then` instruction. If the user typed a
-   selection instead ("1.1, 2.3", "DAG 2", "all critical", "all except 2.1"), call
-   `airflow_audit_select(selection=<their text>)`.
-3. "Stop here" → `airflow_audit_progress(state="stop")`, show its `summary`, stop.
+1. **Write first, ask last, in the same reply.** Write what the step produced (the report,
+   the plan, the fix, the test result), then end the reply with `question` and its `choices`
+   as a numbered list, recommended first. Then stop and wait for the user.
+   **Never call a menu tool (`clarify`) and never call another tool after that text**: a reply
+   that ends with a tool call is often sent without its text, and the user sees nothing.
+2. Do the `then` of the chosen option. A typed selection ("1.1, 2.3", "DAG 2", "all
+   critical") goes to `airflow_audit_select(selection=…)`.
+3. "Stop here" → `airflow_audit_progress(state="stop")`: show the `summary`; the audit is over.
 
-A result with `next_action` instead of a question: do that action now, then continue.
+A result with `next_action` instead of a question: do that action now.
 
 ## Procedure
 
-1. **State of play.** If the user did not run `/airflow-audit`, call `airflow_build_report`
-   (the configured period) and show its `markdown`; then ask its `next_question`
-   ("Which DAG should I diagnose?"). Diagnose nothing before the answer.
-2. **Plan.** `airflow_audit_plan(dag_ids=[…])` diagnoses the chosen DAGs and numbers the
-   problems. Show `plan_text` as is, then ask `next_question` ("Which problem first?").
-3. **Select.** `airflow_audit_select(selection=…)` returns the current item and its
-   `next_action` / `next_question`.
-4. **Handle the item**, following the `airflow-mlops:airflow-fix-proposal` skill for code
-   fixes and `airflow-mlops:airflow-triage` for retries:
-   - code fix → read the code, show the fix (step A), then
-     `airflow_audit_progress(item, state="fix_proposed")` and ask its question
-     ("Test fix N in the sandbox?");
-   - the sandbox result is recorded automatically: its `audit` block holds the next question
-     ("Apply it to your file?");
-   - after the user's file is changed → `state="applied"`; after a real retry the plugin
-     records `retried`; once the run is OK → `state="verified"`.
-5. **Next.** When an item is closed the plugin asks "What next?" (continue, next DAG, stop).
-6. **Resume.** `airflow_audit_plan()` with no arguments returns the audit in progress.
+Order inside one turn: **all the tool calls first, the text last** (the result, then the
+question). Never write text and then call a tool.
 
-**Batches.** When the user picks several problems ("All of DAG 1", "all", "1.1, 2.1"):
-- fixes of the **same DAG** are handled together: read the code once, show each fix, report
-  them with one call (`item="1.1, 1.2"`), test them in **one** sandbox run with **one diff**
-  holding every fix, apply them with one approval of the file;
-- transient failures are retried together: one combined dry-run list, one decision;
-- the plugin keeps a progress message up to date in the conversation by itself: do not
-  rewrite it, just go on.
-
-Always show the progress line (`progress.line`, e.g. `[###----] 3/7 done · next: 1.2`)
-under each step.
+1. **Report.** If the user did not run `/airflow-audit`, call `airflow_build_report`, show its
+   `markdown` and stop: the user names the DAG(s) to diagnose.
+2. **Diagnosis.** `airflow_audit_plan(dag_ids=[…])`: show `plan_text`, end with "Which problem
+   first?".
+3. **Test.** `airflow_audit_select(selection=…)` returns what to do:
+   - **code error**: read the code (`airflow_get_dag_source`), write the diff and test it with
+     `airflow_sandbox_test`, `level="structure"` (it includes the import check). The plugin
+     records the result itself. Then, in one reply: the fix (template of
+     `airflow-mlops:airflow-fix-proposal`, step A), the test result, and the question the test
+     returned: passed → the problems left; failed → "Revise the fix / Next problem / Stop here";
+   - **transient failure**: preview the retry (`airflow_clear_tasks`, `dry_run=true`), then
+     the real retry after the user's approval; check the run (`airflow_get_run_status`) and
+     report `passed` or `failed` with `airflow_audit_progress`.
+4. **End.** "Stop here", or everything tested: the plugin archives the audit and returns a
+   summary (results, tested patches and how to apply them). Show it. When fixes passed their
+   test, the result also has a `next_question` ("Ask Hermes to apply the tested fixes … now?"):
+   ask it. "Apply …" → run the given `git apply` command(s) with the terminal tool (the lock
+   lets only the tested changes through and Hermes asks the user to approve), read the changed
+   lines back, then offer the targeted retry (dry run first). "Not now" → the fixes stay
+   available in this conversation.
 
 ## Pitfalls
 
-- Never diagnose, test, edit or retry anything the user did not choose.
-- Never retry a DAG while one of its tasks still crashes on a code error: the plugin then
-  lists the problems left (same DAG first) instead of offering the retry; do not offer it
-  yourself. The masking item (a final task's trigger_rule hiding the failure) does not block.
-- Never change a DAG file before its sandbox test passed **and** the user picked "Apply it".
-  The plugin's lock enforces it: only the tested change gets through (apply it with
-  `apply_commands.apply`), and Hermes asks the user to approve. A block message is not an
-  error to work around: follow it (test again, or apply the tested patch).
-- Keep the plugin's numbers (1.1, 2.3…) for the whole audit; never renumber.
-- "yes" / "go" answers the last question with its recommended option; ask again if unsure.
+- **Never edit a DAG file during an audit**, even if asked to "apply" mid-audit: say the
+  audit must end first ("Stop here"), then apply the tested patch. The lock blocks it anyway.
+- A transient failure on a DAG that also has a code error is not retried during the audit
+  (the code is not changed, so the retry would fail): the plugin says so and moves on.
+- A fix that **hides** the error (`.get()` instead of a key, a swallowed exception, a default
+  value) passes every sandbox level: when `masking_warnings` is not empty, the plugin asks
+  "it may hide the error… What now?": say why before anything else.
+- Keep the plugin's numbers (1.1, 2.3…); never renumber.
 - A tool error (`ok: false`) is not a step: explain it and ask the same question again.
 
 ## Verification
 
-- Every step ended with a question from the plugin, or with "Stop here" and its summary.
-- `/airflow-status` shows the same numbers and states as your answers.
+- Every step ended with a question from the plugin, or with the archive summary.
+- No DAG file changed during the audit (`git status` of the DAGs folder is clean).

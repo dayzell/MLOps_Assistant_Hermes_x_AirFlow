@@ -1,7 +1,7 @@
 ---
 name: airflow-report
 description: Produce the standard Apache Airflow monitoring report (always the same six sections — scope and period, health, per-task performance, data quality, incidents and actions, recommendations) from airflow_build_report, without inventing numbers. Use for daily/weekly pipeline status, health checks, SLA or performance reviews, or when the user runs /airflow-report.
-version: 0.6.0
+version: 0.7.0
 author: Joseph Keita
 license: MIT
 metadata:
@@ -49,10 +49,11 @@ evidence-based reading. Reply in the user's language.
 3. Then output the tool's `markdown` **as is** (all six sections, same headings, same order).
    Do not drop empty sections: an empty section still says "none" / "not configured" /
    "not instrumented".
-4. If there are incidents, end with the tool's `next_question` ("Which DAG should I
-   diagnose?"): call the `clarify` tool with exactly its question and choices, then do the
-   `then` of the chosen option (it starts the guided audit, `airflow-mlops:airflow-audit`).
-   Do not diagnose before the user has chosen.
+4. The report is the whole answer: write it, then stop. Its last line already invites the
+   user to name the DAG(s) to diagnose. **Do not call any tool after the report** (no menu,
+   no diagnosis): a reply that ends with a tool call is often sent without its text. When the
+   user then names a DAG, follow `airflow-mlops:airflow-triage` (or
+   `airflow-mlops:airflow-audit` for a guided audit).
 
 ## Writing rules
 
