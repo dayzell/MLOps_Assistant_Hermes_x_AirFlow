@@ -1,0 +1,197 @@
+name: airflow-mlops
+version: 1.3.0
+description: Apache Airflow MLOps assistant — monitor DAGs, diagnose failed runs, targeted retries and standard reports
+author: Joseph Keita
+manifest_version: 2
+api_version: 1
+license: MIT
+homepage: https://github.com/dayzell/MLOps_Assistant_Hermes_x_AirFlow
+requires_hermes: ">=0.23.0"
+tags:
+  - airflow
+  - mlops
+  - monitoring
+  - data-engineering
+
+provides_tools:
+  - airflow_list_dags
+  - airflow_get_dag
+  - airflow_get_dag_runs
+  - airflow_get_run_status
+  - airflow_get_task_logs
+  - airflow_get_xcoms
+  - airflow_get_dependencies
+  - airflow_get_dag_source
+  - airflow_review_dag
+  - airflow_watch_check
+  - airflow_diagnose_run
+  - airflow_build_report
+  - airflow_clear_tasks
+  - airflow_sandbox_test
+  - airflow_audit_plan
+  - airflow_audit_select
+  - airflow_audit_progress
+  - airflow_audit_timeline
+
+provides_hooks:
+  - pre_tool_call
+  - pre_llm_call
+  - post_tool_call
+
+# Only one credential set is needed: AIRFLOW_TOKEN (auth_mode: token) or
+# AIRFLOW_USERNAME + AIRFLOW_PASSWORD (auth_mode: basic or jwt).
+requires_env:
+  - name: AIRFLOW_USERNAME
+    description: Airflow user (auth_mode basic or jwt). Leave empty when using AIRFLOW_TOKEN.
+    url: https://airflow.apache.org/docs/apache-airflow/stable/security/api.html
+  - name: AIRFLOW_PASSWORD
+    description: Password of AIRFLOW_USERNAME (auth_mode basic or jwt).
+    url: https://airflow.apache.org/docs/apache-airflow/stable/security/api.html
+    secret: true
+  - name: AIRFLOW_TOKEN
+    description: Static bearer token / JWT (auth_mode token). Leave empty when using a username.
+    url: https://airflow.apache.org/docs/apache-airflow/stable/security/api.html
+    secret: true
+
+config_schema:
+  base_url:
+    type: str
+    default: "http://localhost:8080"
+    description: Airflow webserver / API server base URL (without /api/vX).
+  api_version:
+    type: str
+    default: v2
+    choices: [v1, v2]
+    description: "REST API generation: v1 = Airflow 2.x (/api/v1), v2 = Airflow 3.x (/api/v2)."
+  auth_mode:
+    type: str
+    default: jwt
+    choices: [basic, token, jwt]
+    description: "basic = HTTP basic (2.x), token = static bearer token, jwt = POST /auth/token (3.x)."
+  verify_tls:
+    type: bool
+    default: true
+    description: Verify the TLS certificate of the Airflow server.
+  timeout_seconds:
+    type: float
+    default: 15
+    description: HTTP timeout per request, in seconds.
+  max_retries:
+    type: int
+    default: 2
+    description: Retries for idempotent reads on network errors and HTTP 502/503/504.
+  page_size:
+    type: int
+    default: 100
+    description: Page size used for paginated endpoints (Airflow caps it with maximum_page_limit).
+  dag_allowlist:
+    type: list
+    default: ["*"]
+    description: Glob patterns of DAG ids the plugin may read or act on. DAGs outside are refused.
+  read_only:
+    type: bool
+    default: true
+    description: When true, write tools (task clearing) are not exposed to the agent.
+  log_max_lines:
+    type: int
+    default: 200
+    description: Maximum number of log lines returned (tail).
+  log_max_chars:
+    type: int
+    default: 20000
+    description: Maximum number of log characters returned.
+  error_context_lines:
+    type: int
+    default: 40
+    description: Maximum size, in lines, of the extracted error/traceback block.
+  xcom_max_chars:
+    type: int
+    default: 2000
+    description: XCom values larger than this (JSON characters) are truncated.
+  data_quality_xcom_key:
+    type: str
+    default: data_quality
+    description: XCom key used by data-quality tasks (see README, data-quality convention).
+  sla_thresholds:
+    type: dict
+    default: {}
+    description: "Optional SLA thresholds in seconds: {\"dag_id\": 3600, \"dag_id.task_id\": 600}."
+  report_default_period:
+    type: str
+    default: 24h
+    description: Default period of /airflow-report (e.g. 24h, 7d).
+  auto_remediation_enabled:
+    type: bool
+    default: false
+    description: Allow automatic retries of transient failures without human approval (bounded).
+  auto_retry_max_attempts:
+    type: int
+    default: 2
+    description: Maximum automatic retries per (dag_id, run_id, task_id); beyond, escalate to a human.
+  auto_retry_backoff_seconds:
+    type: int
+    default: 300
+    description: Base backoff between automatic retries (doubled at each attempt).
+  error_patterns_path:
+    type: str
+    default: ""
+    description: Optional path to a custom error_patterns.yaml (defaults to the bundled rules).
+  sandbox_enabled:
+    type: bool
+    default: false
+    description: Enable airflow_sandbox_test (Docker must be available to Hermes' local terminal).
+  sandbox_image:
+    type: str
+    default: ""
+    description: Docker image with Airflow + your DAG dependencies (built once, e.g. FROM apache/airflow).
+  sandbox_dags_path:
+    type: str
+    default: ""
+    description: Local folder of your DAGs; copied for each test, never modified.
+  sandbox_max_level:
+    type: str
+    default: structure
+    choices: [import, structure, task]
+    description: Highest level run without asking you; higher levels need your approval.
+  sandbox_cpus:
+    type: float
+    default: 1.0
+    description: CPU limit of the sandbox container (max 8).
+  sandbox_memory:
+    type: str
+    default: 2g
+    description: Memory limit of the sandbox container (256m to 16g, no swap).
+  sandbox_timeout_seconds:
+    type: int
+    default: 300
+    description: Maximum duration of one sandbox test (30 to 540 seconds).
+  sandbox_sample_rows:
+    type: int
+    default: 1000
+    description: Sample size exposed to the task as AIRFLOW_SANDBOX_SAMPLE_ROWS.
+  sandbox_heavy_operators:
+    type: list
+    default:
+      - SparkSubmitOperator
+      - KubernetesPodOperator
+      - DatabricksSubmitRunOperator
+      - SnowflakeOperator
+      - BigQueryInsertJobOperator
+      - EmrAddStepsOperator
+      - BashOperator
+      - DockerOperator
+      - SSHOperator
+      - "@task.bash"
+      - "@task.docker"
+      - "@task.kubernetes"
+      - "@task.virtualenv"
+      - "@task.external_python"
+    description: Operators (or TaskFlow decorators, as Airflow reports them) never executed at the 'task' level.
+  sandbox_max_tests_per_session:
+    type: int
+    default: 5
+    description: Maximum number of sandbox tests per Hermes session.
+  dag_write_guard:
+    type: str
+    default: sandbox_required
+    description: "Lock on the files of sandbox_dags_path: sandbox_required (only the exact change that passed the sandbox, after a human approval), approval_only (a human approves every write), off."

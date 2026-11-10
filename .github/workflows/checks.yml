@@ -1,0 +1,32 @@
+# Release quarantine and lint, as the Hermes plugin catalog recommends (admission rule 10:
+# "run your own release quarantine (uv --exclude-newer in your CI)").
+name: plugin checks
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+
+      - name: Dependencies resolve with releases older than 3 days only
+        run: uv pip compile pyproject.toml --python-version 3.11 --exclude-newer "3 days"
+
+      - name: The declared floors resolve (oldest API-compatible versions)
+        run: uv pip compile pyproject.toml --python-version 3.11 --resolution lowest-direct
+
+      - name: No committed bytecode or binaries (catalog rule 17)
+        run: |
+          if git ls-files | grep -E '\.(pyc|pyo|so|dll|exe|dylib|wasm)$'; then
+            echo "Committed bytecode or binary found"; exit 1
+          fi
+
+      - name: Lint
+        run: uv tool run --from "ruff>=0.6,<1" ruff check .

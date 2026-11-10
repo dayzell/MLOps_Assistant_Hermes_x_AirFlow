@@ -1,0 +1,160 @@
+# Error classification rules used by airflow_diagnose_run.
+#
+# Each rule:
+#   id           unique identifier (shown to the LLM as justification)
+#   category     transient | critical
+#   description  human explanation
+#   patterns     Python regexes (case-sensitive unless ignore_case: true)
+#   keywords     plain substrings, always case-insensitive
+#   ignore_case  optional, applies to patterns (default false)
+#   min_tries    optional: the rule only counts as `category` from this try number on;
+#                before that it counts as `below_min_tries_category` (e.g. a first OOM is
+#                transient, a recurring OOM is critical)
+#
+# Matching: the extracted error block is scanned first; the log tail is only used when the
+# error block matches nothing. A matching critical rule always wins over transient rules.
+# Override this file with the `error_patterns_path` setting.
+
+version: 1
+rules:
+  # ------------------------------------------------------------------ critical
+  - id: python_syntax_error
+    category: critical
+    description: The DAG or task code does not parse (SyntaxError / IndentationError).
+    patterns:
+      - '\b(SyntaxError|IndentationError|TabError)\b'
+
+  - id: python_import_error
+    category: critical
+    description: A module or name cannot be imported (missing dependency or broken code).
+    patterns:
+      - '\b(ImportError|ModuleNotFoundError)\b'
+      - "No module named '"
+
+  - id: python_code_error
+    category: critical
+    description: Programming error in task code (KeyError, NameError, TypeError, AttributeError, IndexError).
+    patterns:
+      - '\b(KeyError|NameError|TypeError|AttributeError|IndexError|UnboundLocalError|ZeroDivisionError)\b'
+
+  - id: schema_mismatch
+    category: critical
+    description: Data does not match the expected schema (missing column, bad type, cast error).
+    patterns:
+      - '\b(SchemaError|UndefinedColumn|UndefinedTable|DatatypeMismatch|InvalidTextRepresentation)\b'
+      - 'column "?[\w.]+"? (does not exist|not found)'
+      - 'invalid input syntax for'
+      - 'no such (table|column)'
+      - 'cannot cast'
+      - 'Schema mismatch|schema mismatch'
+    keywords:
+      - "data type mismatch"
+
+  - id: data_quality_failed
+    category: critical
+    description: A data-quality check failed (assertion, Great Expectations, SQL check, AirflowFailException).
+    patterns:
+      - '\b(AssertionError|AirflowFailException)\b'
+      - 'Data quality check failed'
+      - 'Validation failed'
+      - 'Test failed with the following results'
+      - 'checks_passed["'']?\s*[:=]\s*(False|false)'
+
+  - id: permission_denied
+    category: critical
+    description: The task lacks a permission (filesystem, database, cloud IAM, HTTP 401/403).
+    patterns:
+      - '\b(PermissionError|AccessDenied(Exception)?|InsufficientPrivilege|Forbidden)\b'
+      - 'Permission denied'
+      - '\b(401|403)\b (Client Error|Unauthorized|Forbidden)'
+    keywords:
+      - "not authorized to perform"
+      - "access denied"
+
+  - id: missing_connection_or_config
+    category: critical
+    description: An Airflow connection, variable or configuration value is missing.
+    patterns:
+      - "The conn_id `?[\\w.-]+`? isn't defined"
+      - "conn_id [`'\"]?[\\w.-]+[`'\"]? isn't defined"
+      - 'Variable [\w.-]+ does not exist'
+      - '\b(AirflowConfigException|AirflowNotFoundException)\b'
+      - 'environment variable [\w]+ is not set'
+
+  - id: out_of_memory
+    category: critical
+    min_tries: 2
+    below_min_tries_category: transient
+    description: The task ran out of memory. A first occurrence may be transient; a recurring one is critical.
+    patterns:
+      - '\b(MemoryError|OOMKilled)\b'
+      - 'Out of memory|out of memory'
+      - 'Cannot allocate memory'
+      - '(exit code|exit status|return code) -?137\b'
+      - 'Negsignal\.SIGKILL'
+
+  # ------------------------------------------------------------------ transient
+  - id: network_timeout
+    category: transient
+    description: A network call or the task itself timed out.
+    patterns:
+      - '\b(TimeoutError|ReadTimeout|ConnectTimeout|ReadTimeoutError|ConnectTimeoutError|AirflowTaskTimeout|DeadlineExceeded)\b'
+      - 'socket\.timeout'
+      - '(timed out|Timeout exceeded|Read timed out)'
+
+  - id: connection_reset
+    category: transient
+    description: The connection was reset, refused or aborted by a remote service.
+    patterns:
+      - '\b(ConnectionResetError|ConnectionRefusedError|ConnectionAbortedError|BrokenPipeError|RemoteDisconnected|ConnectionError)\b'
+      - 'Connection (reset by peer|refused|aborted)'
+      - 'server closed the connection unexpectedly'
+
+  - id: rate_limited_or_unavailable
+    category: transient
+    description: The remote service throttled or was unavailable (HTTP 429/502/503/504).
+    patterns:
+      - '\b(429|502|503|504)\b[^\n]{0,40}(Too Many Requests|Bad Gateway|Service Unavailable|Gateway Time-?out)'
+      - 'Too Many Requests|Service Unavailable|Bad Gateway'
+      - '\b(ThrottlingException|SlowDown|RequestLimitExceeded|TooManyRequests)\b'
+    keywords:
+      - "rate limit"
+
+  - id: pool_slots_exhausted
+    category: transient
+    description: The Airflow pool had no free slot (the task could not be scheduled in time).
+    patterns:
+      - 'open slots in pool'
+      - 'Not executing .* since the number of tasks running or queued from DAG'
+    keywords:
+      - "pool is full"
+      - "no open slots"
+
+  - id: sensor_timeout
+    category: transient
+    description: A sensor timed out waiting for an external condition.
+    patterns:
+      - '\bAirflowSensorTimeout\b'
+      - 'Sensor has timed out'
+      - 'Snap\. Time is OUT'
+
+  - id: external_resource_unavailable
+    category: transient
+    description: An external dependency was temporarily unavailable (DNS, database lock, pool, cloud API).
+    patterns:
+      - 'Temporary failure in name resolution'
+      - 'Name or service not known'
+      - 'temporarily unavailable'
+      - 'could not connect to server'
+      - 'deadlock detected|Lock wait timeout exceeded'
+      - 'Connection pool is full'
+      - '\b(ServiceUnavailable|InternalServerError|OperationalError)\b'
+
+  - id: infrastructure_interruption
+    category: transient
+    description: The task was killed by the infrastructure (zombie, SIGTERM, worker lost), not by its code.
+    patterns:
+      - 'detected as zombie|zombie task'
+      - 'killed externally'
+      - 'Received SIGTERM'
+      - 'Worker exited prematurely|WorkerLostError'
