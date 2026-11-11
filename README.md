@@ -190,6 +190,7 @@ On each push, it checks that the dependencies resolve with `uv --exclude-newer "
 at their lowest declared floors. It also checks that no bytecode or binary file is committed,
 and runs the linter.
 
+This project was assisted by Claude Opus 5.5
 ## License
 
 MIT, © 2026 Joseph Keita
